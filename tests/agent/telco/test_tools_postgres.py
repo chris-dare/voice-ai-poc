@@ -5,7 +5,8 @@ from decimal import Decimal
 from uuid import UUID
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func
+from sqlmodel import select
 
 from voice_ai.agent.persistence.database import Database
 from voice_ai.agent.persistence.seed import seed_demo_data
@@ -41,9 +42,13 @@ async def test_real_queries_preserve_money_and_seed_is_idempotent(postgres: Data
     await seed_demo_data(postgres)
 
     async with postgres.session() as session:
-        count = await session.scalar(
-            select(func.count()).select_from(Charge).where(Charge.subscriber_id == SUBSCRIBER)
-        )
+        count = (
+            await session.exec(
+                select(func.count())
+                .select_from(Charge)
+                .where(Charge.subscriber_id == SUBSCRIBER)
+            )
+        ).one()
 
     assert balance["amount"] == "GHS 42.50"
     assert len(charges["charges"]) == 4
@@ -70,9 +75,13 @@ async def test_confirmed_plan_change_writes_request_record(postgres: Database) -
     )
 
     async with postgres.session() as session:
-        row = await session.scalar(
-            select(PlanChangeRequest).where(PlanChangeRequest.id == UUID(result["request_id"]))
-        )
+        row = (
+            await session.exec(
+                select(PlanChangeRequest).where(
+                    PlanChangeRequest.id == UUID(result["request_id"])
+                )
+            )
+        ).first()
 
     assert row is not None
     assert row.quoted_price == Decimal("60.00")

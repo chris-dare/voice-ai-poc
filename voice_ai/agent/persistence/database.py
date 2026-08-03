@@ -9,15 +9,12 @@ from time import perf_counter
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
-    AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import DeclarativeBase
+from sqlmodel.ext.asyncio.session import AsyncSession
 
-
-class Base(DeclarativeBase):
-    """Shared SQLAlchemy metadata for the agent service."""
+from voice_ai.agent.persistence.model import TableModel
 
 
 class Database:
@@ -25,7 +22,11 @@ class Database:
 
     def __init__(self, url: str, *, echo: bool = False) -> None:
         self.engine: AsyncEngine = create_async_engine(url, echo=echo, pool_pre_ping=True)
-        self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
+        self.session_factory = async_sessionmaker(
+            self.engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
@@ -43,11 +44,11 @@ class Database:
 
     async def ping_ms(self) -> float:
         async with self.session() as session:
-            await session.execute(text("SELECT 1"))
+            await session.exec(text("SELECT 1"))
             samples: list[float] = []
             for _ in range(3):
                 started = perf_counter()
-                await session.execute(text("SELECT 1"))
+                await session.exec(text("SELECT 1"))
                 samples.append((perf_counter() - started) * 1000)
         return median(samples)
 
@@ -58,4 +59,4 @@ class Database:
         from voice_ai.agent.telco import models as _telco_models  # noqa: F401
 
         async with self.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
+            await connection.run_sync(TableModel.metadata.create_all)

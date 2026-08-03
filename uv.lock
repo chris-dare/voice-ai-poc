@@ -3127,6 +3127,20 @@ asyncio = [
 ]
 
 [[package]]
+name = "sqlmodel"
+version = "0.0.39"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "sqlalchemy" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/68/ee/22a0559283c3cf6048678e787ed5d4959dcd00dedd8ba4567eeae684eeb1/sqlmodel-0.0.39.tar.gz", hash = "sha256:23d8e50a8d8ee936032ed79c55023a5d618dd6bc3c510bbf4909d1a7a605a570", size = 91057, upload-time = "2026-06-25T13:01:38.475Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/7d/b9813a582d4eb310be35e1fc7dfaae71207d7b62e9e53be314ebd251b53b/sqlmodel-0.0.39-py3-none-any.whl", hash = "sha256:90ebe92ce5cc11d7fff8dc7cb594790a102333c8fe7c14865254f6fc5c939795", size = 29680, upload-time = "2026-06-25T13:01:37.494Z" },
+]
+
+[[package]]
 name = "sse-starlette"
 version = "3.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -3370,6 +3384,7 @@ dependencies = [
     { name = "pyjwt", extra = ["crypto"] },
     { name = "rich" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "sqlmodel" },
     { name = "typer" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -3400,6 +3415,7 @@ requires-dist = [
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10,<3" },
     { name = "rich", specifier = ">=14,<15" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.41,<3" },
+    { name = "sqlmodel", specifier = ">=0.0.38,<0.1" },
     { name = "typer", specifier = ">=0.16,<1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.35,<1" },
 ]

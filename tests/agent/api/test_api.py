@@ -18,7 +18,8 @@ from voice_ai.agent.api.services import (
     request_fingerprint,
 )
 from voice_ai.agent.app import create_agent_app
-from voice_ai.agent.persistence.database import Base, Database
+from voice_ai.agent.persistence.database import Database
+from voice_ai.agent.persistence.model import TableModel
 from voice_ai.agent.protocol import (
     AgentTurnRequest,
     ResponseCompleted,
@@ -147,7 +148,7 @@ class BlockingRuntime(FakeRuntime):
 @pytest.fixture
 async def public_service(tmp_path):
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'public-api.db'}")
-    # Importing the service above registers all public tables on Base.metadata.
+    # Importing the service above registers all public tables on TableModel.metadata.
     await database.create_schema()
     settings = Settings(
         database_url=str(database.engine.url),
@@ -164,7 +165,7 @@ async def public_service(tmp_path):
     finally:
         await service.shutdown()
         async with database.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.drop_all)
+            await connection.run_sync(TableModel.metadata.drop_all)
         await database.close()
 
 

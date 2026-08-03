@@ -198,6 +198,8 @@ semantics.
 
 ## Dependency notes
 
+- SQLModel defines the persisted domain models and typed async sessions; Alembic remains responsible
+  for schema migrations, while SQLAlchemy primitives are retained for database-specific constraints.
 - Pydantic AI is pinned to 2.14.1.
 - Pydantic AI Harness is kept on compatible 0.9.x releases.
 - Monty is pinned to the compatible sandbox release.

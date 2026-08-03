@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlmodel import select
 
 from voice_ai.agent.api.models import IdentityBinding
 from voice_ai.agent.persistence.database import Database
@@ -17,13 +17,15 @@ async def resolve_subscriber(
     subject_id: str,
 ) -> UUID | None:
     async with database.session() as session:
-        return await session.scalar(
-            select(IdentityBinding.subscriber_id).where(
-                IdentityBinding.tenant_id == tenant_id,
-                IdentityBinding.subject_id == subject_id,
-                IdentityBinding.active.is_(True),
+        return (
+            await session.exec(
+                select(IdentityBinding.subscriber_id).where(
+                    IdentityBinding.tenant_id == tenant_id,
+                    IdentityBinding.subject_id == subject_id,
+                    IdentityBinding.active.is_(True),
+                )
             )
-        )
+        ).first()
 
 
 async def bind_identity(

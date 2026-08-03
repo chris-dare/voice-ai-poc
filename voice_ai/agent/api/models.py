@@ -8,7 +8,6 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
-    ForeignKey,
     Index,
     Integer,
     String,
@@ -16,57 +15,69 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlmodel import Field
 
-from voice_ai.agent.persistence.database import Base
+from voice_ai.agent.persistence.model import TableModel
 
 
-class Conversation(Base):
+class Conversation(TableModel, table=True):
     __tablename__ = "api_conversations"
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    runtime_session_id: Mapped[UUID] = mapped_column(unique=True, nullable=False)
-    tenant_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    subject_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    subscriber_id: Mapped[UUID | None] = mapped_column(nullable=True)
-    agent_id: Mapped[str] = mapped_column(String(120), nullable=False)
-    status: Mapped[str] = mapped_column(String(24), nullable=False)
-    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    session_state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    id: str = Field(sa_type=String(64), primary_key=True)
+    runtime_session_id: UUID = Field(unique=True, nullable=False)
+    tenant_id: str = Field(sa_type=String(255), nullable=False)
+    subject_id: str = Field(sa_type=String(255), nullable=False)
+    subscriber_id: UUID | None = Field(default=None, nullable=True)
+    agent_id: str = Field(sa_type=String(120), nullable=False)
+    status: str = Field(sa_type=String(24), nullable=False)
+    metadata_json: dict[str, Any] = Field(sa_type=JSON, nullable=False)
+    session_state: dict[str, Any] = Field(sa_type=JSON, nullable=False)
+    created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    updated_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
         Index("ix_api_conversations_owner", "tenant_id", "subject_id", "updated_at"),
     )
 
 
-class ResponseRecord(Base):
+class ResponseRecord(TableModel, table=True):
     __tablename__ = "api_responses"
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    conversation_id: Mapped[str | None] = mapped_column(
-        ForeignKey("api_conversations.id", ondelete="CASCADE"), nullable=True
+    id: str = Field(sa_type=String(64), primary_key=True)
+    conversation_id: str | None = Field(
+        default=None,
+        sa_type=String(64),
+        foreign_key="api_conversations.id",
+        ondelete="CASCADE",
+        nullable=True,
     )
-    runtime_session_id: Mapped[UUID] = mapped_column(nullable=False)
-    tenant_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    subject_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    subscriber_id: Mapped[UUID | None] = mapped_column(nullable=True)
-    agent_id: Mapped[str] = mapped_column(String(120), nullable=False)
-    status: Mapped[str] = mapped_column(String(24), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    cancellation_reason: Mapped[str | None] = mapped_column(String(64))
-    input_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
-    session_state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    output_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
-    required_action_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
-    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
-    usage_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
-    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    background: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    stream: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    runtime_session_id: UUID = Field(nullable=False)
+    tenant_id: str = Field(sa_type=String(255), nullable=False)
+    subject_id: str = Field(sa_type=String(255), nullable=False)
+    subscriber_id: UUID | None = Field(default=None, nullable=True)
+    agent_id: str = Field(sa_type=String(120), nullable=False)
+    status: str = Field(sa_type=String(24), nullable=False)
+    created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    started_at: datetime | None = Field(
+        default=None, sa_type=DateTime(timezone=True), nullable=True
+    )
+    completed_at: datetime | None = Field(
+        default=None, sa_type=DateTime(timezone=True), nullable=True
+    )
+    cancellation_reason: str | None = Field(
+        default=None, sa_type=String(64), nullable=True
+    )
+    input_json: list[dict[str, Any]] = Field(sa_type=JSON, nullable=False)
+    session_state: dict[str, Any] = Field(sa_type=JSON, nullable=False)
+    output_json: list[dict[str, Any]] = Field(sa_type=JSON, nullable=False)
+    required_action_json: dict[str, Any] | None = Field(
+        default=None, sa_type=JSON, nullable=True
+    )
+    error_json: dict[str, Any] | None = Field(default=None, sa_type=JSON, nullable=True)
+    usage_json: dict[str, Any] | None = Field(default=None, sa_type=JSON, nullable=True)
+    metadata_json: dict[str, Any] = Field(sa_type=JSON, nullable=False)
+    background: bool = Field(sa_type=Boolean, nullable=False)
+    stream: bool = Field(sa_type=Boolean, nullable=False)
 
     __table_args__ = (
         Index("ix_api_responses_owner", "tenant_id", "subject_id", "created_at"),
@@ -86,58 +97,67 @@ class ResponseRecord(Base):
     )
 
 
-class ResponseEvent(Base):
+class ResponseEvent(TableModel, table=True):
     __tablename__ = "api_response_events"
 
-    response_id: Mapped[str] = mapped_column(
-        ForeignKey("api_responses.id", ondelete="CASCADE"), primary_key=True
+    response_id: str = Field(
+        sa_type=String(64),
+        foreign_key="api_responses.id",
+        ondelete="CASCADE",
+        primary_key=True,
     )
-    sequence_number: Mapped[int] = mapped_column(Integer, primary_key=True)
-    type: Mapped[str] = mapped_column(String(80), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    data_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    sequence_number: int = Field(sa_type=Integer, primary_key=True)
+    type: str = Field(sa_type=String(80), nullable=False)
+    created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    data_json: dict[str, Any] = Field(sa_type=JSON, nullable=False)
 
     __table_args__ = (
         Index("ix_api_response_events_created", "created_at"),
     )
 
 
-class RequiredAction(Base):
+class RequiredAction(TableModel, table=True):
     __tablename__ = "api_required_actions"
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    response_id: Mapped[str] = mapped_column(
-        ForeignKey("api_responses.id", ondelete="CASCADE"), unique=True, nullable=False
+    id: str = Field(sa_type=String(64), primary_key=True)
+    response_id: str = Field(
+        sa_type=String(64),
+        foreign_key="api_responses.id",
+        ondelete="CASCADE",
+        unique=True,
+        nullable=False,
     )
-    tenant_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    subject_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    type: Mapped[str] = mapped_column(String(32), nullable=False)
-    title: Mapped[str] = mapped_column(String(240), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    decision: Mapped[str | None] = mapped_column(String(16))
-    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    tenant_id: str = Field(sa_type=String(255), nullable=False)
+    subject_id: str = Field(sa_type=String(255), nullable=False)
+    type: str = Field(sa_type=String(32), nullable=False)
+    title: str = Field(sa_type=String(240), nullable=False)
+    description: str = Field(sa_type=Text, nullable=False)
+    expires_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    decision: str | None = Field(default=None, sa_type=String(16), nullable=True)
+    decided_at: datetime | None = Field(
+        default=None, sa_type=DateTime(timezone=True), nullable=True
+    )
+    created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
         Index("ix_api_required_actions_expiry", "expires_at", "decision"),
     )
 
 
-class IdempotencyRecord(Base):
+class IdempotencyRecord(TableModel, table=True):
     __tablename__ = "api_idempotency_records"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    tenant_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    subject_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    method: Mapped[str] = mapped_column(String(12), nullable=False)
-    route: Mapped[str] = mapped_column(String(255), nullable=False)
-    key: Mapped[str] = mapped_column(String(255), nullable=False)
-    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
-    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    resource_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    id: int | None = Field(default=None, sa_type=Integer, primary_key=True)
+    tenant_id: str = Field(sa_type=String(255), nullable=False)
+    subject_id: str = Field(sa_type=String(255), nullable=False)
+    method: str = Field(sa_type=String(12), nullable=False)
+    route: str = Field(sa_type=String(255), nullable=False)
+    key: str = Field(sa_type=String(255), nullable=False)
+    fingerprint: str = Field(sa_type=String(64), nullable=False)
+    resource_type: str = Field(sa_type=String(32), nullable=False)
+    resource_id: str = Field(sa_type=String(64), nullable=False)
+    created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    expires_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
         UniqueConstraint(
@@ -152,17 +172,19 @@ class IdempotencyRecord(Base):
     )
 
 
-class IdentityBinding(Base):
+class IdentityBinding(TableModel, table=True):
     """Tenant-scoped association between an authenticated subject and a subscriber."""
 
     __tablename__ = "api_identity_bindings"
 
-    tenant_id: Mapped[str] = mapped_column(String(255), primary_key=True)
-    subject_id: Mapped[str] = mapped_column(String(255), primary_key=True)
-    subscriber_id: Mapped[UUID] = mapped_column(
-        ForeignKey("subscribers.id", ondelete="RESTRICT"), nullable=False
+    tenant_id: str = Field(sa_type=String(255), primary_key=True)
+    subject_id: str = Field(sa_type=String(255), primary_key=True)
+    subscriber_id: UUID = Field(
+        foreign_key="subscribers.id",
+        ondelete="RESTRICT",
+        nullable=False,
     )
-    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    active: bool = Field(default=True, sa_type=Boolean, nullable=False)
+    created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
 
     __table_args__ = (Index("ix_api_identity_bindings_subscriber", "subscriber_id"),)

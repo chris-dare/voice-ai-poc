@@ -4,7 +4,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete
+from sqlmodel import select
 
 from voice_ai.agent.persistence.database import Database
 from voice_ai.agent.telco.models import (
@@ -34,17 +35,17 @@ async def seed_demo_data(database: Database, *, reset: bool = False) -> None:
     today = now.date()
     async with database.session_factory.begin() as session:
         if reset:
-            await session.execute(
+            await session.exec(
                 delete(PlanChangeRequest).where(
                     PlanChangeRequest.subscriber_id.in_(DEMO_SUBSCRIBER_IDS)
                 )
             )
-            await session.execute(delete(Charge).where(Charge.subscriber_id.in_(DEMO_SUBSCRIBER_IDS)))
-            await session.execute(
+            await session.exec(delete(Charge).where(Charge.subscriber_id.in_(DEMO_SUBSCRIBER_IDS)))
+            await session.exec(
                 delete(DataUsage).where(DataUsage.subscriber_id.in_(DEMO_SUBSCRIBER_IDS))
             )
-            await session.execute(delete(Subscriber).where(Subscriber.id.in_(DEMO_SUBSCRIBER_IDS)))
-            await session.execute(delete(Outage).where(Outage.id == DEMO_OUTAGE_ID))
+            await session.exec(delete(Subscriber).where(Subscriber.id.in_(DEMO_SUBSCRIBER_IDS)))
+            await session.exec(delete(Outage).where(Outage.id == DEMO_OUTAGE_ID))
 
         plans = (
             Plan(code="FLEX_20", name="Flex 20", monthly_price=Decimal("20.00"), data_allowance_mb=5_120, voice_minutes=120, description="5 GB data and 120 voice minutes"),
@@ -94,4 +95,8 @@ async def seed_demo_data(database: Database, *, reset: bool = False) -> None:
 
 async def demo_data_present(database: Database, subscriber_id: UUID) -> bool:
     async with database.session() as session:
-        return await session.scalar(select(Subscriber.id).where(Subscriber.id == subscriber_id)) is not None
+        return (
+            await session.exec(
+                select(Subscriber.id).where(Subscriber.id == subscriber_id)
+            )
+        ).first() is not None

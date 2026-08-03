@@ -4,8 +4,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlmodel import select
 
 from voice_ai.agent.telco.models import (
     Charge,
@@ -45,7 +45,7 @@ async def get_data_usage(
 ) -> dict[str, object]:
     async with session_factory() as session:
         row = (
-            await session.execute(
+            await session.exec(
                 select(DataUsage, Plan)
                 .join(Subscriber, Subscriber.id == DataUsage.subscriber_id)
                 .join(Plan, Plan.code == Subscriber.plan_code)
@@ -69,7 +69,7 @@ async def get_current_plan(
 ) -> dict[str, object]:
     async with session_factory() as session:
         row = (
-            await session.execute(
+            await session.exec(
                 select(Subscriber, Plan)
                 .join(Plan, Plan.code == Subscriber.plan_code)
                 .where(Subscriber.id == subscriber_id)
@@ -97,7 +97,7 @@ async def list_recent_charges(
     async with session_factory() as session:
         charges = (
             (
-                await session.scalars(
+                await session.exec(
                     select(Charge)
                     .where(Charge.subscriber_id == subscriber_id)
                     .order_by(Charge.charged_at.desc())
@@ -125,7 +125,7 @@ async def explain_latest_bill(
     """Summarize the current mock billing cycle against the recurring plan price."""
     async with session_factory() as session:
         row = (
-            await session.execute(
+            await session.exec(
                 select(Subscriber, Plan)
                 .join(Plan, Plan.code == Subscriber.plan_code)
                 .where(Subscriber.id == subscriber_id)
@@ -136,7 +136,7 @@ async def explain_latest_bill(
         subscriber, plan = row
         charges = list(
             (
-                await session.scalars(
+                await session.exec(
                     select(Charge)
                     .where(Charge.subscriber_id == subscriber_id)
                     .order_by(Charge.charged_at.desc())
@@ -189,7 +189,7 @@ async def check_network_status(
             raise ToolError("Subscriber not found")
         outages = (
             (
-                await session.scalars(
+                await session.exec(
                     select(Outage)
                     .where(Outage.region == subscriber.region, Outage.status != "resolved")
                     .order_by(Outage.started_at.desc())
@@ -225,7 +225,7 @@ async def list_available_plans(
             raise ToolError("Subscriber not found")
         plans = (
             (
-                await session.scalars(
+                await session.exec(
                     select(Plan).where(Plan.active.is_(True)).order_by(Plan.monthly_price)
                 )
             )

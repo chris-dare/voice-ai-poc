@@ -19,6 +19,7 @@ dependencies = [
   "pyjwt[crypto]>=2.10,<3",
   "rich>=14,<15",
   "sqlalchemy[asyncio]>=2.0.41,<3",
+  "sqlmodel>=0.0.38,<0.1",
   "typer>=0.16,<1",
   "uvicorn[standard]>=0.35,<1",
 ]

@@ -8,7 +8,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from loguru import logger
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_
+from sqlmodel import select
 
 from voice_ai.agent.api.auth import AuthContext
 from voice_ai.agent.api.models import (
@@ -79,7 +80,7 @@ class AgentApiService:
         async with self.database.session() as session:
             actions = list(
                 (
-                    await session.scalars(
+                    await session.exec(
                         select(RequiredAction).where(
                             RequiredAction.decision.is_(None)
                         )
@@ -175,7 +176,7 @@ class AgentApiService:
         async with self.database.session() as session:
             conversations = list(
                 (
-                    await session.scalars(
+                    await session.exec(
                         select(Conversation)
                         .where(*conditions)
                         .order_by(
@@ -231,12 +232,14 @@ class AgentApiService:
                 raise ApiProblem(404, "not_found", "Conversation not found.")
             if conversation.status == "deleted":
                 return False
-            active = await session.scalar(
-                select(ResponseRecord.id).where(
-                    ResponseRecord.conversation_id == conversation_id,
-                    ResponseRecord.status.in_(ACTIVE_STATUSES),
+            active = (
+                await session.exec(
+                    select(ResponseRecord.id).where(
+                        ResponseRecord.conversation_id == conversation_id,
+                        ResponseRecord.status.in_(ACTIVE_STATUSES),
+                    )
                 )
-            )
+            ).first()
             if active:
                 raise ApiProblem(
                     409,
@@ -254,7 +257,7 @@ class AgentApiService:
                 "conversation_deletion",
                 conversation_id,
             )
-            await session.execute(
+            await session.exec(
                 delete(ResponseRecord).where(
                     ResponseRecord.conversation_id == conversation_id
                 )
@@ -303,12 +306,14 @@ class AgentApiService:
                     )
                 agent_id = conversation.agent_id
                 runtime_session_id = conversation.runtime_session_id
-                existing = await session.scalar(
-                    select(ResponseRecord.id).where(
-                        ResponseRecord.conversation_id == conversation.id,
-                        ResponseRecord.status.in_(ACTIVE_STATUSES),
+                existing = (
+                    await session.exec(
+                        select(ResponseRecord.id).where(
+                            ResponseRecord.conversation_id == conversation.id,
+                            ResponseRecord.status.in_(ACTIVE_STATUSES),
+                        )
                     )
-                )
+                ).first()
                 if existing:
                     raise ApiProblem(
                         409,
@@ -427,7 +432,7 @@ class AgentApiService:
                 )
             responses = list(
                 (
-                    await session.scalars(
+                    await session.exec(
                         select(ResponseRecord)
                         .where(*conditions)
                         .order_by(
@@ -602,7 +607,7 @@ class AgentApiService:
             if response is None or not _owns(response, auth):
                 raise ApiProblem(404, "not_found", "Response not found.")
             bounds = (
-                await session.execute(
+                await session.exec(
                     select(
                         func.min(ResponseEvent.sequence_number),
                         func.max(ResponseEvent.sequence_number),
@@ -622,7 +627,7 @@ class AgentApiService:
                 )
             events = list(
                 (
-                    await session.scalars(
+                    await session.exec(
                         select(ResponseEvent)
                         .where(
                             ResponseEvent.response_id == response_id,
@@ -663,12 +668,12 @@ class AgentApiService:
                 ResponseRecord.completed_at.is_not(None),
                 ResponseRecord.completed_at < event_cutoff,
             )
-            await session.execute(
+            await session.exec(
                 delete(ResponseEvent).where(
                     ResponseEvent.response_id.in_(expired_response_ids)
                 )
             )
-            await session.execute(
+            await session.exec(
                 delete(IdempotencyRecord).where(
                     IdempotencyRecord.expires_at < now
                 )
@@ -918,11 +923,13 @@ class AgentApiService:
         **fields: Any,
     ) -> dict[str, Any]:
         sequence = (
-            await session.scalar(
-                select(func.max(ResponseEvent.sequence_number)).where(
-                    ResponseEvent.response_id == response_row.id
+            (
+                await session.exec(
+                    select(func.max(ResponseEvent.sequence_number)).where(
+                        ResponseEvent.response_id == response_row.id
+                    )
                 )
-            )
+            ).one()
             or 0
         ) + 1
         created_at = now or _now()
@@ -1180,13 +1187,15 @@ class AgentApiService:
 
     async def _expire_if_needed(self, response_id: str) -> None:
         async with self.database.session() as session:
-            action = await session.scalar(
-                select(RequiredAction).where(
-                    RequiredAction.response_id == response_id,
-                    RequiredAction.decision.is_(None),
-                    RequiredAction.expires_at <= _now(),
+            action = (
+                await session.exec(
+                    select(RequiredAction).where(
+                        RequiredAction.response_id == response_id,
+                        RequiredAction.decision.is_(None),
+                        RequiredAction.expires_at <= _now(),
+                    )
                 )
-            )
+            ).first()
         if action:
             await self._expire_action(action.id, response_id)
 
@@ -1195,7 +1204,7 @@ class AgentApiService:
         async with self.database.session_factory.begin() as session:
             responses = list(
                 (
-                    await session.scalars(
+                    await session.exec(
                         select(ResponseRecord)
                         .where(ResponseRecord.status.in_({"queued", "in_progress"}))
                         .with_for_update()
@@ -1251,15 +1260,17 @@ class AgentApiService:
             return None
         if len(key) > 255:
             raise ApiProblem(400, "invalid_idempotency_key", "Idempotency-Key is too long.")
-        record = await session.scalar(
-            select(IdempotencyRecord).where(
-                IdempotencyRecord.tenant_id == auth.tenant_id,
-                IdempotencyRecord.subject_id == auth.subject_id,
-                IdempotencyRecord.method == method,
-                IdempotencyRecord.route == route,
-                IdempotencyRecord.key == key,
+        record = (
+            await session.exec(
+                select(IdempotencyRecord).where(
+                    IdempotencyRecord.tenant_id == auth.tenant_id,
+                    IdempotencyRecord.subject_id == auth.subject_id,
+                    IdempotencyRecord.method == method,
+                    IdempotencyRecord.route == route,
+                    IdempotencyRecord.key == key,
+                )
             )
-        )
+        ).first()
         if record and record.fingerprint != fingerprint:
             raise ApiProblem(
                 409,

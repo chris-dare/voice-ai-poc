@@ -1,6 +1,6 @@
 import json
 
-from sqlalchemy import select
+from sqlmodel import select
 
 from voice_ai.agent.eval_models import EvalCaseResult, EvalRun
 from voice_ai.agent.eval_persistence import persist_eval_run
@@ -79,7 +79,7 @@ async def test_eval_run_is_persisted_as_immutable_experiment(tmp_path) -> None:
             run = await session.get(EvalRun, run_id)
             cases = list(
                 (
-                    await session.scalars(
+                    await session.exec(
                         select(EvalCaseResult)
                         .where(EvalCaseResult.run_id == run_id)
                         .order_by(EvalCaseResult.sequence_number)
