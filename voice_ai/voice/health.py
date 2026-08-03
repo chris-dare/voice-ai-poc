@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import asyncio
+import shutil
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Literal
+
+import httpx
+import nltk
+from faster_whisper.utils import download_model
+
+from voice_ai.agent.models import ModelReadiness, check_configured_model
+from voice_ai.agent.persistence.database import Database
+from voice_ai.shared.config import Settings
+
+Status = Literal["pass", "warn", "fail"]
+
+
+@dataclass(frozen=True, slots=True)
+class CheckResult:
+    name: str
+    status: Status
+    detail: str
+    fix_command: str | None = None
+    latency_ms: float | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {key: value for key, value in asdict(self).items() if value is not None}
+
+
+async def run_checks(
+    settings: Settings,
+    database: Database,
+    *,
+    include_frontend: bool = True,
+) -> tuple[list[CheckResult], ModelReadiness]:
+    model_task = asyncio.create_task(check_configured_model(settings))
+    database_task = asyncio.create_task(_database_check(settings, database))
+    whisper_task = asyncio.create_task(asyncio.to_thread(_whisper_check, settings.whisper_model))
+    checks = [
+        await database_task,
+        await whisper_task,
+        _nltk_check(settings),
+        _tts_check(settings),
+        _deployment_check(settings),
+    ]
+    model_status = await model_task
+    checks.insert(0, _model_check(model_status))
+    if include_frontend:
+        checks.append(_frontend_check(settings.frontend_dist))
+    return checks, model_status
+
+
+async def run_voice_checks(
+    settings: Settings,
+    *,
+    include_frontend: bool = True,
+) -> list[CheckResult]:
+    """Check only dependencies owned by the public voice gateway."""
+    agent_task = asyncio.create_task(_agent_service_check(settings))
+    whisper_task = asyncio.create_task(asyncio.to_thread(_whisper_check, settings.whisper_model))
+    checks = [
+        await agent_task,
+        await whisper_task,
+        _nltk_check(settings),
+        _tts_check(settings),
+        _deployment_check(settings),
+    ]
+    if include_frontend:
+        checks.append(_frontend_check(settings.frontend_dist))
+    return checks
+
+
+def overall_status(checks: list[CheckResult]) -> str:
+    if any(check.status == "fail" for check in checks):
+        return "not_ready"
+    if any(check.status == "warn" for check in checks):
+        return "degraded"
+    return "ready"
+
+
+async def _agent_service_check(settings: Settings) -> CheckResult:
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            response = await client.get(f"{settings.agent_base_url.rstrip('/')}/readyz")
+        payload = response.json()
+        if response.status_code != 200:
+            return CheckResult(
+                "Agent service",
+                "fail",
+                f"Agent is not ready at {settings.agent_base_url}: {payload.get('status', 'unknown')}",
+                "uv run voice-ai agent",
+            )
+        return CheckResult(
+            "Agent service",
+            "pass",
+            f"Private agent API ready at {settings.agent_base_url}",
+        )
+    except (httpx.HTTPError, ValueError) as exc:
+        return CheckResult(
+            "Agent service",
+            "fail",
+            f"Agent is not reachable at {settings.agent_base_url}: {type(exc).__name__}",
+            "uv run voice-ai agent",
+        )
+
+
+def _model_check(status: ModelReadiness) -> CheckResult:
+    fix_command = None
+    if status.provider == "ollama" and not status.ready:
+        fix_command = "ollama serve"
+    return CheckResult(
+        "Agent model",
+        "pass" if status.ready else "fail",
+        f"{status.model}: {status.detail}",
+        fix_command,
+    )
+
+
+async def _database_check(settings: Settings, database: Database) -> CheckResult:
+    try:
+        latency = await database.ping_ms()
+        status: Status = "warn" if latency > 20 else "pass"
+        detail = f"Database ready; query latency {latency:.1f} ms"
+        if latency > 20:
+            detail += " (above the 20 ms local budget)"
+        return CheckResult("PostgreSQL", status, detail, latency_ms=latency)
+    except Exception as exc:
+        return CheckResult(
+            "PostgreSQL",
+            "fail",
+            f"Database is not ready: {type(exc).__name__}: {exc}",
+            "docker compose up -d postgres",
+        )
+
+
+def _whisper_check(model: str) -> CheckResult:
+    try:
+        path = download_model(model, local_files_only=True)
+        return CheckResult("Whisper", "pass", f"{model} is cached at {path}")
+    except Exception:
+        return CheckResult(
+            "Whisper",
+            "fail",
+            f"{model} is not in the local model cache",
+            "uv run voice-ai doctor --fix --yes",
+        )
+
+
+def _tts_check(settings: Settings) -> CheckResult:
+    if settings.tts_provider == "kokoro":
+        model = settings.kokoro_download_dir / "kokoro-v1.0.onnx"
+        voices = settings.kokoro_download_dir / "voices-v1.0.bin"
+        if model.is_file() and voices.is_file():
+            return CheckResult("Kokoro", "pass", f"{settings.kokoro_voice} is cached")
+        fallback = _piper_check(settings)
+        if fallback.status != "fail":
+            return CheckResult(
+                "Kokoro",
+                "warn",
+                f"{settings.kokoro_voice} is missing; Piper fallback is available",
+                "uv run voice-ai doctor --fix --yes",
+            )
+        return CheckResult(
+            "Kokoro",
+            "fail",
+            f"{settings.kokoro_voice} is missing and no speech fallback is available",
+            "uv run voice-ai doctor --fix --yes",
+        )
+    return _piper_check(settings)
+
+
+def _piper_check(settings: Settings) -> CheckResult:
+    model = settings.piper_download_dir / f"{settings.piper_voice}.onnx"
+    config = settings.piper_download_dir / f"{settings.piper_voice}.onnx.json"
+    if model.is_file() and config.is_file():
+        return CheckResult("Piper", "pass", f"{settings.piper_voice} is cached")
+    if shutil.which("say"):
+        return CheckResult(
+            "Piper",
+            "warn",
+            f"{settings.piper_voice} is missing; macOS say fallback will be used",
+            "uv run voice-ai doctor --fix --yes",
+        )
+    return CheckResult(
+        "Piper",
+        "fail",
+        f"{settings.piper_voice} is missing and no supported fallback exists",
+        "uv run voice-ai doctor --fix --yes",
+    )
+
+
+def _nltk_check(settings: Settings) -> CheckResult:
+    nltk_dir = settings.model_cache_dir / "nltk"
+    try:
+        nltk.data.find("tokenizers/punkt_tab", paths=[str(nltk_dir)])
+        return CheckResult("Sentence tokenizer", "pass", f"NLTK punkt_tab is cached at {nltk_dir}")
+    except LookupError:
+        return CheckResult(
+            "Sentence tokenizer",
+            "fail",
+            "NLTK punkt_tab is absent; Pipecat sentence aggregation may fail offline",
+            "uv run voice-ai doctor --fix --yes",
+        )
+
+
+def _deployment_check(settings: Settings) -> CheckResult:
+    errors = settings.public_profile_errors()
+    if errors:
+        return CheckResult(
+            "HTTPS / ICE",
+            "fail",
+            "; ".join(errors),
+            "Edit PUBLIC_BASE_URL and ICE_SERVERS in .env",
+        )
+    if settings.deployment_profile == "laptop":
+        return CheckResult(
+            "HTTPS / ICE",
+            "warn",
+            "Laptop profile: phones require trusted HTTPS and a LAN without client isolation",
+        )
+    return CheckResult("HTTPS / ICE", "pass", "Public HTTPS profile includes a TURN relay")
+
+
+def _frontend_check(path: Path) -> CheckResult:
+    index = path / "index.html"
+    if index.is_file():
+        return CheckResult("Browser bundle", "pass", f"Static bundle ready at {path}")
+    return CheckResult(
+        "Browser bundle",
+        "fail",
+        f"{index} is missing",
+        "npm --prefix frontend ci && npm --prefix frontend run build",
+    )

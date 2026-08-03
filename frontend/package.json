@@ -1,0 +1,19 @@
+{
+  "name": "voice-ai-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite --host 0.0.0.0",
+    "check": "node --test && vite build"
+  },
+  "dependencies": {
+    "@auth0/auth0-spa-js": "^2.24.1",
+    "@pipecat-ai/client-js": "^1.6.0",
+    "@pipecat-ai/small-webrtc-transport": "^1.2.1"
+  },
+  "devDependencies": {
+    "vite": "^7.1.0"
+  }
+}

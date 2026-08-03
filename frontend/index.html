@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f7f7f5" />
+    <meta
+      name="description"
+      content="A fast, general-purpose AI assistant with text and real-time voice"
+    />
+    <title>Voice AI</title>
+  </head>
+  <body>
+    <div id="boot-screen" class="center-screen" aria-live="polite">
+      <div class="brand-symbol large" aria-hidden="true"><span></span><span></span><span></span></div>
+      <p>Opening Voice AI…</p>
+    </div>
+
+    <main id="auth-screen" class="auth-screen hidden">
+      <section class="auth-story" aria-label="Product introduction">
+        <a class="auth-brand" href="/" aria-label="Voice AI home">
+          <span class="brand-symbol" aria-hidden="true"><span></span><span></span><span></span></span>
+          <span>Voice AI</span>
+        </a>
+        <div class="auth-copy">
+          <p class="overline">YOUR EVERYDAY ASSISTANT</p>
+          <h1>One conversation.<br />However you want to have it.</h1>
+          <p>Type a question or simply say it. Search the web, work through a problem, and pick up where you left off.</p>
+        </div>
+        <div class="auth-example" aria-hidden="true">
+          <div class="example-user">Compare the best approaches to reducing API latency.</div>
+          <div class="example-agent">
+            <span class="mini-symbol"><i></i><i></i><i></i></span>
+            I’ll compare the trade-offs, verify current techniques, and turn the result into an actionable plan.
+          </div>
+        </div>
+      </section>
+      <section class="auth-action">
+        <div class="auth-card">
+          <div class="mobile-auth-brand">
+            <span class="brand-symbol" aria-hidden="true"><span></span><span></span><span></span></span>
+            <span>Voice AI</span>
+          </div>
+          <h2>Welcome</h2>
+          <p id="auth-message">Sign in to start a conversation and keep your history in sync.</p>
+          <button id="login-button" class="button primary wide" type="button">Continue to sign in</button>
+          <p class="auth-footnote">Your conversations are private to your account.</p>
+        </div>
+      </section>
+    </main>
+
+    <div id="app" class="app-shell hidden">
+      <div id="sidebar-scrim" class="sidebar-scrim" aria-hidden="true"></div>
+      <aside id="sidebar" class="sidebar" aria-label="Conversation history">
+        <div class="sidebar-head">
+          <a class="sidebar-brand" href="/" aria-label="Voice AI home">
+            <span class="brand-symbol" aria-hidden="true"><span></span><span></span><span></span></span>
+            <span>Voice AI</span>
+          </a>
+          <button id="close-sidebar" class="icon-button mobile-only" type="button" aria-label="Close sidebar">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+          </button>
+        </div>
+
+        <button id="new-chat" class="new-chat" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          <span>New conversation</span>
+        </button>
+
+        <nav class="history-nav" aria-label="Recent conversations">
+          <div class="history-label">Recent</div>
+          <div id="history-list" class="history-list" aria-live="polite"></div>
+        </nav>
+
+        <div class="sidebar-footer">
+          <button id="profile-button" class="profile-button" type="button" aria-expanded="false">
+            <img id="profile-image" class="avatar hidden" alt="" />
+            <span id="profile-initials" class="avatar initials">AI</span>
+            <span class="profile-copy"><strong id="profile-name">Account</strong><small id="profile-email">Signed in</small></span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4" /></svg>
+          </button>
+          <div id="profile-menu" class="profile-menu hidden">
+            <button id="open-diagnostics" type="button">Connection details</button>
+            <button id="logout-button" type="button">Sign out</button>
+          </div>
+        </div>
+      </aside>
+
+      <section class="chat-shell">
+        <header class="chat-header">
+          <button id="open-sidebar" class="icon-button mobile-only" type="button" aria-label="Open conversation history">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+          </button>
+          <div class="agent-heading">
+            <strong>Voice AI</strong>
+            <span id="service-status"><i></i> Checking services</span>
+          </div>
+          <button id="header-new-chat" class="icon-button mobile-only" type="button" aria-label="New conversation">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          </button>
+          <button id="desktop-diagnostics" class="header-action desktop-only" type="button">
+            <span id="latency-pill">Ready</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
+          </button>
+        </header>
+
+        <div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
+
+        <section id="conversation" class="conversation" aria-label="Conversation">
+          <div id="empty-state" class="welcome-state">
+            <div class="welcome-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+            <h1>How can I help?</h1>
+            <p>Ask a question, work through a task, or explore anything on your mind.</p>
+            <div class="suggestions">
+              <button type="button" data-prompt="Compare three practical ways to reduce API latency and explain the trade-offs.">
+                <span class="suggestion-icon account" aria-hidden="true">≡</span>
+                <span><strong>Think through a problem</strong><small>Compare options and trade-offs</small></span>
+              </button>
+              <button type="button" data-prompt="Calculate the monthly payment on a GHS 120,000 loan at 18% over 5 years.">
+                <span class="suggestion-icon bill" aria-hidden="true">∑</span>
+                <span><strong>Run a calculation</strong><small>Use sandboxed code</small></span>
+              </button>
+              <button type="button" data-prompt="Search the web for today's top technology news and summarize it.">
+                <span class="suggestion-icon web" aria-hidden="true">◎</span>
+                <span><strong>Search the web</strong><small>Get a current summary</small></span>
+              </button>
+            </div>
+          </div>
+          <div id="messages" class="messages" aria-live="polite"></div>
+          <div id="scroll-anchor" aria-hidden="true"></div>
+        </section>
+
+        <section id="voice-panel" class="voice-panel hidden" aria-label="Live voice conversation">
+          <div class="voice-visual" id="voice-visual" data-state="idle" aria-hidden="true">
+            <i></i><i></i><i></i><span></span>
+          </div>
+          <div class="voice-copy">
+            <strong id="voice-state">Starting voice…</strong>
+            <span id="voice-detail">Requesting microphone access</span>
+          </div>
+          <div class="voice-meter"><i id="mic-level"></i></div>
+          <div class="voice-actions">
+            <button id="mute-button" class="round-button" type="button" aria-label="Mute microphone">
+              <svg class="mic-on" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"/></svg>
+              <svg class="mic-off" viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 16 16M9 6v5a3 3 0 0 0 4.2 2.75M15 10V6a3 3 0 0 0-5.6-1.5M5 11a7 7 0 0 0 11.7 5.16M12 18v3M9 21h6"/></svg>
+            </button>
+            <button id="end-voice" class="round-button end" type="button" aria-label="End voice conversation">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5.3 15.2c4.4-3.2 9-3.2 13.4 0l1.8-2.5c.4-.6.3-1.4-.3-1.8C15 7.1 9 7.1 3.8 10.9c-.6.4-.7 1.2-.3 1.8l1.8 2.5Z"/></svg>
+            </button>
+          </div>
+        </section>
+
+        <footer class="composer-area">
+          <form id="composer" class="composer">
+            <textarea id="prompt-input" rows="1" maxlength="16000" placeholder="Message Voice AI" aria-label="Message Voice AI"></textarea>
+            <div class="composer-actions">
+              <button id="voice-button" class="composer-icon" type="button" aria-label="Start voice conversation">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"/></svg>
+              </button>
+              <button id="send-button" class="send-button" type="submit" aria-label="Send message" disabled>
+                <svg class="send-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6" /></svg>
+                <svg class="stop-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1" /></svg>
+              </button>
+            </div>
+          </form>
+          <p>AI can make mistakes. Check important information.</p>
+        </footer>
+      </section>
+    </div>
+
+    <dialog id="diagnostics-dialog" class="diagnostics-dialog">
+      <div class="dialog-head">
+        <div><span class="overline">SYSTEM</span><h2>Connection details</h2></div>
+        <button id="close-diagnostics" class="icon-button" type="button" aria-label="Close diagnostics">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+        </button>
+      </div>
+      <div class="diagnostic-grid">
+        <div><span>Agent API</span><strong id="agent-health">Checking</strong></div>
+        <div><span>Voice</span><strong id="voice-health">Checking</strong></div>
+        <div><span>Last turn</span><strong id="last-latency">—</strong></div>
+        <div><span>Median voice latency</span><strong id="median-latency">—</strong></div>
+      </div>
+      <div class="activity-block">
+        <h3>Recent tool activity</h3>
+        <div id="tool-activity"><p>No tool calls in this session.</p></div>
+      </div>
+    </dialog>
+
+    <audio id="bot-audio" autoplay playsinline></audio>
+    <script type="module" src="/src/app.js"></script>
+  </body>
+</html>

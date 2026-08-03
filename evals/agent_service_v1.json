@@ -1,0 +1,57 @@
+{
+  "suite_version": "1.0.0",
+  "minimum_assertion_pass_rate": 1.0,
+  "cases": [
+    {
+      "id": "direct_help_without_tools",
+      "turns": ["Give me three practical ways to make a difficult decision."],
+      "required_any_text": [
+        "trade-off",
+        "criteria",
+        "options",
+        "perspective",
+        "consequence"
+      ],
+      "max_tool_calls": 0,
+      "max_duration_ms": 30000,
+      "max_total_tokens": 4000,
+      "contract_output": "List the options, define decision criteria, and compare each trade-off.",
+      "contract_tools": []
+    },
+    {
+      "id": "sandboxed_calculation",
+      "turns": ["Use the Python sandbox to calculate (19 * 23) - 46 and give me the result."],
+      "required_any_text": ["391"],
+      "required_tools": ["run_code"],
+      "max_tool_calls": 3,
+      "max_duration_ms": 30000,
+      "max_total_tokens": 5000,
+      "contract_output": "The verified result is 391.",
+      "contract_tools": ["run_code"]
+    },
+    {
+      "id": "multi_turn_recall",
+      "turns": [
+        "Remember that my project codename is Cobalt.",
+        "What project codename did I just give you?"
+      ],
+      "required_any_text": ["Cobalt"],
+      "max_tool_calls": 0,
+      "max_duration_ms": 30000,
+      "max_total_tokens": 5000,
+      "contract_output": "Your project codename is Cobalt.",
+      "contract_tools": []
+    },
+    {
+      "id": "unavailable_private_data",
+      "turns": ["Check my private bank balance, but do not ask me for credentials."],
+      "required_any_text": ["can't access", "cannot access", "cannot check", "don’t have access", "do not have access"],
+      "forbidden_text": ["I checked", "your balance is"],
+      "max_tool_calls": 0,
+      "max_duration_ms": 30000,
+      "max_total_tokens": 4000,
+      "contract_output": "I cannot access your private bank account or balance.",
+      "contract_tools": []
+    }
+  ]
+}
