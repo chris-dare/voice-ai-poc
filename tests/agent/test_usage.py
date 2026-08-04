@@ -49,6 +49,83 @@ def test_usage_tracker_aggregates_provider_usage_and_estimated_cost() -> None:
     assert Decimal(summary.estimated_cost_usd or "0") > 0
 
 
+def test_openrouter_reported_cost_is_primary_and_reasoning_is_visible() -> None:
+    tracker = UsageTracker()
+    tracker.completed(
+        ModelResponse(
+            parts=[TextPart(content="A considered response")],
+            usage=RequestUsage(
+                input_tokens=500,
+                output_tokens=80,
+                details={"reasoning_tokens": 42},
+            ),
+            model_name="openai/gpt-5.6-luna",
+            provider_name="openrouter",
+            provider_response_id="gen-test-123",
+            provider_details={
+                "cost": 0.0012345,
+                "downstream_provider": "openai",
+                "is_byok": False,
+            },
+        ),
+        agent="general_assistant",
+        duration_ms=90,
+    )
+
+    summary = tracker.summary(
+        usage=RunUsage(requests=1, input_tokens=500, output_tokens=80),
+        wall_clock_ms=100,
+        route_model="openrouter:openai/gpt-5.6-luna",
+        route_provider="openrouter",
+        gateway=True,
+        fallback_models=(),
+        observed_tool_calls=0,
+    )
+
+    assert summary.reported_cost_usd == "0.001234500000"
+    assert summary.reasoning_tokens == 42
+    assert summary.cost_status == "reported"
+    assert summary.cost_source == "openrouter"
+    assert summary.attempts[0].downstream_provider == "openai"
+    assert summary.attempts[0].is_byok is False
+    assert summary.attempts[0].provider_response_id == "gen-test-123"
+
+
+def test_attempt_accounting_includes_isolated_subagent_usage() -> None:
+    tracker = UsageTracker()
+    for agent, input_tokens, output_tokens in (
+        ("general_assistant", 100, 20),
+        ("researcher", 400, 80),
+    ):
+        tracker.completed(
+            ModelResponse(
+                parts=[TextPart(content="response")],
+                usage=RequestUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                ),
+                model_name="test-model",
+                provider_name="test",
+            ),
+            agent=agent,
+            duration_ms=10,
+        )
+
+    summary = tracker.summary(
+        # The root RunUsage deliberately excludes the isolated child budget.
+        usage=RunUsage(requests=1, input_tokens=100, output_tokens=20),
+        wall_clock_ms=25,
+        route_model="test:model",
+        route_provider="test",
+        gateway=False,
+        fallback_models=(),
+        observed_tool_calls=1,
+    )
+
+    assert summary.total_tokens == 600
+    assert summary.model_requests == 2
+
+
 def test_unknown_model_preserves_usage_and_marks_cost_unavailable() -> None:
     tracker = UsageTracker()
     tracker.completed(

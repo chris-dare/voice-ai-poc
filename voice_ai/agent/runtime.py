@@ -34,6 +34,7 @@ from pydantic_ai.messages import (
     PartStartEvent,
 )
 from pydantic_ai.models import Model
+from pydantic_ai.models.openrouter import OpenRouterModelSettings
 from pydantic_ai.run import AgentRunResultEvent
 from pydantic_ai_harness import CodeMode
 from pydantic_ai_harness.compaction import LimitWarner, SlidingWindow
@@ -44,6 +45,7 @@ from voice_ai.agent.models import (
     ModelConfigurationError,
     ModelSelection,
     check_model_readiness,
+    classify_model_failure,
     resolve_model,
 )
 from voice_ai.agent.protocol import (
@@ -58,18 +60,21 @@ from voice_ai.agent.protocol import (
     tool_label,
 )
 from voice_ai.agent.usage import UsageTracker, model_usage_hooks
-from voice_ai.shared.config import Settings
+from voice_ai.shared.config import AgentSettings
 from voice_ai.shared.observability import record_agent_turn
 
 SYSTEM_PROMPT = """You are a capable, friendly general-purpose AI assistant.
 Answer the user's actual question directly. Use tools when they materially improve correctness.
 For current or uncertain facts, load the web-research capability. Use at most two focused searches
-unless the user explicitly requests broad research. Open the authoritative result before making a
+and fetch at most two authoritative sources unless the user explicitly requests broad research.
+Open the authoritative result before making a
 "latest", version, price, schedule, legal, or similarly time-sensitive claim; do not treat a search
 snippet or third-party aggregator as final evidence. Fetch a supplied public URL when its contents
 matter. Use the Python sandbox for calculations and data transformations. For genuinely
-complex work, load planning and the deep-work specialists; delegate only self-contained tasks and
-synthesize their findings into one answer. External capabilities may also be available through MCP.
+complex work, use the deep-work specialists; delegate only self-contained tasks and
+synthesize their findings into one answer. A straightforward lookup, calculation, or direct answer
+is not complex work and must not be delegated. If you delegate, use the specialist's result instead
+of repeating the same work yourself. External capabilities may also be available through MCP.
 
 Never claim that you searched, calculated, fetched, checked, delegated, or completed an action
 unless the corresponding tool actually ran. Never promise to do work later. If a required
@@ -102,11 +107,12 @@ class AgentRuntime:
 
     def __init__(
         self,
-        settings: Settings,
+        settings: AgentSettings,
         *,
         model: Model | None = None,
     ) -> None:
         self.settings = settings
+        self._injected_model = model is not None
         self._sessions: dict[UUID, AgentSession] = {}
         self._sessions_lock = asyncio.Lock()
         self._started = False
@@ -123,6 +129,25 @@ class AgentRuntime:
             if model is not None
             else resolve_model(settings)
         )
+        self._model_selections: dict[str, ModelSelection] = {
+            self.model_selection.primary_id: self.model_selection
+        }
+        if model is None:
+            for model_id in settings.selectable_model_ids:
+                if model_id in self._model_selections:
+                    continue
+                try:
+                    self._model_selections[model_id] = resolve_model(
+                        settings,
+                        model_id=model_id,
+                        include_fallbacks=False,
+                    )
+                except Exception:
+                    # Invalid optional routes remain visible as unavailable in
+                    # the model catalog and must not prevent healthy routes starting.
+                    logger.bind(model=model_id).warning(
+                        "Optional agent model could not be resolved"
+                    )
         logger.bind(
             model=self.model_selection.primary_id,
             provider=self.model_selection.provider,
@@ -140,25 +165,28 @@ class AgentRuntime:
             ).model
         capabilities: list[Any] = [
             model_usage_hooks(),
-            _thinking(settings),
+            _thinking(settings.agent_thinking_effort),
             CodeMode(tools=_use_code_mode, dynamic_catalog=True),
             _web_capability(defer_loading=True, research=False),
         ]
         if settings.agent_deep_agents_enabled:
-            capabilities.extend(
-                [
+            if settings.agent_planning_enabled:
+                capabilities.append(
                     Planning(
                         guidance=(
-                            "Use a short plan only for work with several dependent steps. Keep "
-                            "exactly one item in progress and update the full plan as work advances."
+                            "Use a short plan only for work with at least three dependent steps. "
+                            "Never plan a direct answer, calculation, or straightforward lookup. "
+                            "Keep exactly one item in progress and update the full plan as work advances."
                         ),
                         id="planning",
-                        description="Maintain a structured plan for multi-step tasks.",
+                        description=(
+                            "Maintain a structured plan for work with at least three dependent "
+                            "steps; never use for a direct answer or straightforward lookup."
+                        ),
                         defer_loading=True,
-                    ),
-                    self._build_subagents(child_model),
-                ]
-            )
+                    )
+                )
+            capabilities.append(self._build_subagents(child_model))
         capabilities.extend(
             [
                 SlidingWindow(
@@ -202,7 +230,7 @@ class AgentRuntime:
             return output
 
     def _build_subagents(self, model: Model) -> SubAgents[AgentDependencies]:
-        shared_settings = ModelSettings(max_tokens=self.settings.agent_max_output_tokens)
+        shared_settings = _specialist_model_settings(model, self.settings)
         researcher = Agent[AgentDependencies, str](
             model,
             name="researcher",
@@ -211,12 +239,14 @@ class AgentRuntime:
             ),
             deps_type=AgentDependencies,
             instructions=(
-                "Research the self-contained task. Search and fetch primary sources where possible, "
-                "distinguish facts from inference, include source URLs, and return concise findings."
+                "Research the self-contained task. Use at most two focused searches and fetch at "
+                "most two authoritative primary sources. Stop once the question is supported; do "
+                "not repeat similar queries. Distinguish facts from inference, include source URLs, "
+                "and return concise findings."
             ),
             capabilities=[
                 model_usage_hooks(),
-                _thinking(self.settings),
+                _thinking(self.settings.agent_deep_thinking_effort),
                 _web_capability(defer_loading=False, research=True),
                 SlidingWindow(max_tokens=20_000, keep_tokens=15_000),
             ],
@@ -238,7 +268,7 @@ class AgentRuntime:
             tools=[current_datetime],
             capabilities=[
                 model_usage_hooks(),
-                _thinking(self.settings),
+                _thinking(self.settings.agent_deep_thinking_effort),
                 CodeMode(tools=_use_code_mode, dynamic_catalog=True),
                 SlidingWindow(max_tokens=16_000, keep_tokens=12_000),
             ],
@@ -257,16 +287,19 @@ class AgentRuntime:
                 "Review the self-contained material skeptically. Identify concrete issues and "
                 "provide corrections. Do not rubber-stamp it and do not invent missing evidence."
             ),
-            capabilities=[model_usage_hooks(), _thinking(self.settings)],
+            capabilities=[
+                model_usage_hooks(),
+                _thinking(self.settings.agent_deep_thinking_effort),
+            ],
             model_settings=shared_settings,
             retries=1,
         )
         self._child_agents.extend([researcher, analyst, reviewer])
         return SubAgents(
             agents=[
-                SubAgent(researcher, timeout_seconds=90, max_calls=3),
-                SubAgent(analyst, timeout_seconds=90, max_calls=2),
-                SubAgent(reviewer, timeout_seconds=60, max_calls=2),
+                self._bounded_subagent(researcher, timeout_seconds=90),
+                self._bounded_subagent(analyst, timeout_seconds=90),
+                self._bounded_subagent(reviewer, timeout_seconds=60),
             ],
             agent_folders=None,
             forward_usage=True,
@@ -275,9 +308,34 @@ class AgentRuntime:
             contain_errors=True,
             id="deep_work",
             description=(
-                "Delegate complex self-contained research, analysis, or review work to specialists."
+                "Delegate genuinely complex, self-contained synthesis, analysis, or review work. "
+                "Do not delegate a direct answer, a simple calculation, or a straightforward "
+                "current-fact lookup that needs only one or two sources."
             ),
             defer_loading=True,
+        )
+
+    def _bounded_subagent(
+        self,
+        agent: Agent[AgentDependencies, str],
+        *,
+        timeout_seconds: float,
+    ) -> SubAgent[AgentDependencies]:
+        return SubAgent(
+            agent,
+            usage_limits=UsageLimits(
+                request_limit=self.settings.agent_subagent_request_limit,
+                tool_calls_limit=self.settings.agent_subagent_tool_call_limit,
+                total_tokens_limit=self.settings.agent_subagent_total_token_limit,
+            ),
+            timeout_seconds=timeout_seconds,
+            max_calls=1,
+            on_failure=(
+                "The specialist reached its execution budget. Synthesize a useful answer from "
+                "the evidence already available, state any uncertainty, and do not delegate to "
+                "that specialist again."
+            ),
+            contain_errors=True,
         )
 
     async def startup(self) -> None:
@@ -307,6 +365,24 @@ class AgentRuntime:
     async def model_readiness(self) -> dict[str, Any]:
         readiness = await check_model_readiness(self.settings, self.model_selection)
         return readiness.as_dict()
+
+    def model_selection_for(self, model_id: str | None) -> ModelSelection:
+        if self._injected_model and model_id is None:
+            return self.model_selection
+        selected_id = model_id or self.settings.agent_model
+        if selected_id not in self.settings.selectable_model_ids:
+            raise ModelConfigurationError(
+                f"Model {selected_id!r} is not in the configured model catalog"
+            )
+        selection = self._model_selections.get(selected_id)
+        if selection is None:
+            selection = resolve_model(
+                self.settings,
+                model_id=selected_id,
+                include_fallbacks=selected_id == self.settings.agent_model,
+            )
+            self._model_selections[selected_id] = selection
+        return selection
 
     async def stream_turn(self, request: AgentTurnRequest) -> AsyncIterator[AgentEvent]:
         started = perf_counter()
@@ -340,11 +416,11 @@ class AgentRuntime:
         started: float,
     ) -> None:
         route = "model"
+        selection = self.model_selection
         try:
-            if self.model_selection.configuration_errors:
-                raise ModelConfigurationError(
-                    "; ".join(self.model_selection.configuration_errors)
-                )
+            selection = self.model_selection_for(request.model_id)
+            if selection.configuration_errors:
+                raise ModelConfigurationError("; ".join(selection.configuration_errors))
             if not self._started:
                 await self.startup()
             usage_tracker = UsageTracker()
@@ -356,8 +432,8 @@ class AgentRuntime:
             turn_log = logger.bind(
                 turn_id=str(request.turn_id),
                 route=route,
-                model=self.model_selection.primary_id,
-                provider=self.model_selection.provider,
+                model=selection.primary_id,
+                provider=selection.provider,
                 history_messages=len(session.history),
             )
             turn_log.info("Agent turn started")
@@ -366,6 +442,7 @@ class AgentRuntime:
                 deps=deps,
                 message_history=session.history,
                 conversation_id=str(request.session_id),
+                model=selection.model,
                 usage_limits=UsageLimits(
                     request_limit=self.settings.agent_request_limit,
                     tool_calls_limit=self.settings.agent_tool_call_limit,
@@ -399,18 +476,18 @@ class AgentRuntime:
             usage_summary = usage_tracker.summary(
                 usage=run_usage,
                 wall_clock_ms=latency_ms,
-                route_model=self.model_selection.primary_id,
-                route_provider=self.model_selection.provider,
-                gateway=self.model_selection.gateway,
-                fallback_models=self.model_selection.fallback_ids,
+                route_model=selection.primary_id,
+                route_provider=selection.provider,
+                gateway=selection.gateway,
+                fallback_models=selection.fallback_ids,
                 observed_tool_calls=observed_tool_calls,
             )
             record_agent_turn(
                 latency_ms=latency_ms,
                 route=route,
                 status="completed",
-                model=self.model_selection.primary_id,
-                provider=self.model_selection.provider,
+                model=selection.primary_id,
+                provider=selection.provider,
             )
             turn_log.bind(
                 latency_ms=latency_ms,
@@ -427,16 +504,17 @@ class AgentRuntime:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            failure = classify_model_failure(exc, selection.primary_id)
             latency_ms = round((perf_counter() - started) * 1_000, 1)
             tracker = locals().get("usage_tracker")
             usage_summary = (
                 tracker.summary(
                     usage=locals().get("run_usage"),
                     wall_clock_ms=latency_ms,
-                    route_model=self.model_selection.primary_id,
-                    route_provider=self.model_selection.provider,
-                    gateway=self.model_selection.gateway,
-                    fallback_models=self.model_selection.fallback_ids,
+                    route_model=selection.primary_id,
+                    route_provider=selection.provider,
+                    gateway=selection.gateway,
+                    fallback_models=selection.fallback_ids,
                     observed_tool_calls=locals().get("observed_tool_calls", 0),
                 )
                 if isinstance(tracker, UsageTracker)
@@ -446,23 +524,22 @@ class AgentRuntime:
                 latency_ms=latency_ms,
                 route=route,
                 status="failed",
-                model=self.model_selection.primary_id,
-                provider=self.model_selection.provider,
+                model=selection.primary_id,
+                provider=selection.provider,
             )
             logger.bind(
                 turn_id=str(request.turn_id),
                 route=route,
-                model=self.model_selection.primary_id,
+                model=selection.primary_id,
                 latency_ms=latency_ms,
             ).exception("Agent turn failed")
             await queue.put(
                 AgentError(
-                    message=(
-                        f"The agent model is not configured: {exc}"
-                        if isinstance(exc, ModelConfigurationError)
-                        else "The agent could not complete that request."
-                    ),
-                    retryable=isinstance(exc, (TimeoutError, ConnectionError)),
+                    message=failure.message,
+                    code=failure.code,
+                    model_id=selection.primary_id,
+                    model_status=failure.status,
+                    retryable=failure.retryable,
                     usage=usage_summary,
                 )
             )
@@ -521,9 +598,7 @@ class AgentRuntime:
                 )
             )
             return name
-        if isinstance(event, PartStartEvent) and isinstance(
-            event.part, NativeToolCallPart
-        ):
+        if isinstance(event, PartStartEvent) and isinstance(event.part, NativeToolCallPart):
             name = event.part.tool_name
             await sink(
                 ToolStarted(
@@ -535,9 +610,7 @@ class AgentRuntime:
                 )
             )
             return name
-        if isinstance(event, PartStartEvent) and isinstance(
-            event.part, NativeToolReturnPart
-        ):
+        if isinstance(event, PartStartEvent) and isinstance(event.part, NativeToolReturnPart):
             name = event.part.tool_name
             await sink(
                 ToolCompleted(
@@ -607,9 +680,31 @@ def current_datetime(timezone: str = "UTC") -> str:
     return datetime.now(zone).isoformat(timespec="seconds")
 
 
-def _thinking(settings: Settings) -> Thinking[Any]:
-    effort: Any = False if settings.agent_thinking_effort == "off" else settings.agent_thinking_effort
+def _thinking(configured_effort: str) -> Thinking[Any]:
+    effort: Any = False if configured_effort == "off" else configured_effort
     return Thinking(effort=effort)
+
+
+def _specialist_model_settings(
+    model: Model,
+    settings: AgentSettings,
+) -> ModelSettings:
+    base = {"max_tokens": settings.agent_max_output_tokens}
+    effort = settings.agent_deep_thinking_effort
+    if model.system == "openrouter" and effort != "off":
+        # OpenRouter can keep reasoning enabled without returning encrypted
+        # reasoning_details that must be replayed byte-for-byte after a tool call.
+        # This avoids upstream invalid_encrypted_content failures while retaining
+        # reasoning-token usage and billed-cost accounting.
+        return OpenRouterModelSettings(
+            **base,
+            openrouter_reasoning={
+                "effort": effort,
+                "enabled": True,
+                "exclude": True,
+            },
+        )
+    return ModelSettings(**base)
 
 
 def _web_capability(
@@ -626,7 +721,7 @@ def _web_capability(
             WebFetch(
                 native=False,
                 local=web_fetch_tool(
-                    max_content_length=20_000 if research else 16_000,
+                    max_content_length=12_000 if research else 8_000,
                     timeout=15 if research else 12,
                 ),
             ),
@@ -660,12 +755,7 @@ def _tool_result_detail(name: str, metadata: object) -> str:
     calls = metadata.get("tool_calls")
     if not isinstance(calls, Mapping) or not calls:
         return "Sandboxed code completed"
-    nested_names = sorted(
-        {
-            str(getattr(call, "tool_name", "tool"))
-            for call in calls.values()
-        }
-    )
+    nested_names = sorted({str(getattr(call, "tool_name", "tool")) for call in calls.values()})
     return f"Sandboxed code completed using: {', '.join(nested_names)}"
 
 

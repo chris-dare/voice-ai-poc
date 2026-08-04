@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
+import httpx
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UserError
 from pydantic_ai.models import Model, infer_model, parse_model_id
-from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.anthropic import AnthropicProvider
+from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.providers.openrouter import OpenRouterProvider
 
 from voice_ai.agent.capabilities import probe_ollama
 from voice_ai.agent.ollama import NativeOllamaModel
-from voice_ai.shared.config import Settings
+from voice_ai.shared.config import AgentSettings
 
 
 class ModelConfigurationError(RuntimeError):
@@ -52,8 +53,27 @@ class ModelReadiness:
         }
 
 
+ModelAvailabilityStatus = Literal["available", "degraded", "unavailable", "unknown"]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProbe:
+    status: ModelAvailabilityStatus
+    reason_code: str | None
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelFailure:
+    code: str
+    message: str
+    retryable: bool
+    status: ModelAvailabilityStatus
+    detail: str
+
+
 def resolve_model(
-    settings: Settings,
+    settings: AgentSettings,
     *,
     model_id: str | None = None,
     include_fallbacks: bool = True,
@@ -71,27 +91,26 @@ def resolve_model(
             use_gateway=_uses_gateway(settings, fallback_id),
         )
         fallback_models.append(fallback)
-        errors.extend(
-            f"Fallback {fallback_id}: {error}" for error in fallback_errors
-        )
+        errors.extend(f"Fallback {fallback_id}: {error}" for error in fallback_errors)
     model: Model = (
         FallbackModel(primary, *fallback_models, fallback_on=_is_transient_model_error)
         if fallback_models
         else primary
     )
     provider, _ = parse_model_id(selected_id)
+    is_gateway = use_gateway or provider == "openrouter"
     return ModelSelection(
         model=model,
         primary_id=selected_id,
         fallback_ids=fallback_ids,
         provider="openai-compatible" if use_gateway else (provider or "unknown"),
-        gateway=use_gateway,
+        gateway=is_gateway,
         configuration_errors=tuple(errors),
     )
 
 
 async def check_model_readiness(
-    settings: Settings,
+    settings: AgentSettings,
     selection: ModelSelection,
 ) -> ModelReadiness:
     if selection.configuration_errors:
@@ -115,16 +134,19 @@ async def check_model_readiness(
             detail = f"{model_name} is installed and supports tools"
         return ModelReadiness(
             ready=(
-                capabilities.reachable
-                and capabilities.installed
-                and capabilities.supports_tools
+                capabilities.reachable and capabilities.installed and capabilities.supports_tools
             ),
             model=selection.primary_id,
             provider="ollama",
             detail=detail,
             fallbacks=selection.fallback_ids,
         )
-    endpoint = " through an OpenAI-compatible gateway" if selection.gateway else ""
+    if provider == "openrouter":
+        endpoint = " through the OpenRouter gateway"
+    elif selection.gateway:
+        endpoint = " through an OpenAI-compatible gateway"
+    else:
+        endpoint = ""
     return ModelReadiness(
         ready=True,
         model=selection.primary_id,
@@ -134,7 +156,7 @@ async def check_model_readiness(
     )
 
 
-async def check_configured_model(settings: Settings) -> ModelReadiness:
+async def check_configured_model(settings: AgentSettings) -> ModelReadiness:
     """Validate provider configuration and locally probe only zero-cost models."""
     try:
         selection = resolve_model(settings)
@@ -154,8 +176,136 @@ async def check_configured_model(settings: Settings) -> ModelReadiness:
         await selection.model.__aexit__(None, None, None)
 
 
+async def probe_model_availability(
+    settings: AgentSettings,
+    model_id: str,
+) -> ModelProbe:
+    """Perform the strongest safe, non-generating probe supported by a route."""
+    try:
+        selection = resolve_model(settings, model_id=model_id, include_fallbacks=False)
+    except Exception as exc:
+        return ModelProbe(
+            status="unavailable",
+            reason_code="model_configuration_invalid",
+            detail=f"Model configuration is invalid: {type(exc).__name__}",
+        )
+    if selection.configuration_errors:
+        return ModelProbe(
+            status="unavailable",
+            reason_code="model_configuration_invalid",
+            detail="; ".join(selection.configuration_errors),
+        )
+
+    provider, model_name = parse_model_id(model_id)
+    if provider == "ollama" and not selection.gateway:
+        capabilities = await probe_ollama(settings.ollama_base_url, model_name)
+        if not capabilities.reachable:
+            return ModelProbe("unavailable", "provider_unreachable", capabilities.detail)
+        if not capabilities.installed:
+            return ModelProbe("unavailable", "model_not_installed", capabilities.detail)
+        if not capabilities.supports_tools:
+            return ModelProbe("unavailable", "tools_not_supported", capabilities.detail)
+        return ModelProbe("available", None, "Installed locally and ready")
+
+    if provider == "openrouter":
+        return await _probe_openrouter(settings, model_name)
+
+    return ModelProbe(
+        "unknown",
+        None,
+        "Configured; availability will be confirmed on first use",
+    )
+
+
+def classify_model_failure(exc: Exception, model_id: str) -> ModelFailure:
+    """Map provider failures to stable, safe public availability semantics."""
+    status_code = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None)
+    rendered = f"{body or ''} {exc}".lower()
+    display_name = model_display_name(model_id)
+
+    if isinstance(exc, ModelConfigurationError):
+        return ModelFailure(
+            "model_configuration_invalid",
+            f"The agent model is not configured: {exc}",
+            False,
+            "unavailable",
+            "Model configuration is invalid",
+        )
+    if status_code in {401, 402, 403}:
+        return ModelFailure(
+            "provider_access_denied",
+            f"{display_name} is currently unavailable. Choose another model.",
+            False,
+            "unavailable",
+            "Provider access is unavailable for this model",
+        )
+    if status_code == 404:
+        return ModelFailure(
+            "model_not_found",
+            f"{display_name} is not available from its provider.",
+            False,
+            "unavailable",
+            "The provider does not offer this model to the configured account",
+        )
+    if status_code == 400 and any(
+        marker in rendered
+        for marker in ("credit balance", "billing", "insufficient credit", "quota")
+    ):
+        return ModelFailure(
+            "provider_account_unavailable",
+            f"{display_name} is currently unavailable. Choose another model.",
+            False,
+            "unavailable",
+            "Provider account access is unavailable for this model",
+        )
+    if status_code == 429:
+        return ModelFailure(
+            "model_rate_limited",
+            f"{display_name} is busy right now. Try again shortly or choose another model.",
+            True,
+            "degraded",
+            "The provider is rate limited",
+        )
+    if isinstance(status_code, int) and status_code >= 500:
+        return ModelFailure(
+            "provider_unavailable",
+            f"{display_name} is temporarily unavailable. Try again or choose another model.",
+            True,
+            "degraded",
+            "The provider is temporarily unavailable",
+        )
+    if isinstance(exc, (TimeoutError, ConnectionError, ModelAPIError)):
+        return ModelFailure(
+            "provider_unavailable",
+            f"{display_name} could not be reached. Try again or choose another model.",
+            True,
+            "degraded",
+            "The model provider could not be reached",
+        )
+    return ModelFailure(
+        "model_request_failed",
+        f"{display_name} could not complete that request.",
+        False,
+        "unknown",
+        "The model request failed",
+    )
+
+
+def model_display_name(model_id: str) -> str:
+    """Create a readable label without coupling the catalog to one provider."""
+    _provider, name = parse_model_id(model_id)
+    words = name.replace("/", " ").replace("_", " ").replace("-", " ").split()
+    return (
+        " ".join(
+            word if any(char.isdigit() for char in word) else word.capitalize() for word in words
+        )
+        or model_id
+    )
+
+
 def _resolve_single(
-    settings: Settings,
+    settings: AgentSettings,
     model_id: str,
     *,
     use_gateway: bool,
@@ -182,13 +332,13 @@ def _resolve_single(
         )
         return model, errors
 
-    if provider == "anthropic":
-        key = _secret_value(settings.anthropic_api_key)
-        errors = [] if key else ["ANTHROPIC_API_KEY is required for the configured model"]
+    if provider == "openrouter":
+        key = _secret_value(settings.openrouter_api_key)
+        errors = [] if key else ["OPENROUTER_API_KEY is required for the configured model"]
         return (
-            AnthropicModel(
+            OpenRouterModel(
                 model_name,
-                provider=AnthropicProvider(api_key=key or "anthropic-key-not-configured"),
+                provider=OpenRouterProvider(api_key=key or "openrouter-key-not-configured"),
             ),
             errors,
         )
@@ -203,9 +353,74 @@ def _resolve_single(
     return infer_model(model_id), []
 
 
-def _uses_gateway(settings: Settings, model_id: str) -> bool:
+def _uses_gateway(settings: AgentSettings, model_id: str) -> bool:
     provider, _ = parse_model_id(model_id)
     return bool(settings.agent_gateway_base_url and provider == "openai-chat")
+
+
+async def _probe_openrouter(
+    settings: AgentSettings,
+    model_name: str,
+) -> ModelProbe:
+    key = _secret_value(settings.openrouter_api_key)
+    if not key:
+        return ModelProbe(
+            "unavailable",
+            "model_configuration_invalid",
+            "OpenRouter credentials are not configured",
+        )
+    headers = {"Authorization": f"Bearer {key}"}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            key_response = await client.get(
+                "https://openrouter.ai/api/v1/key",
+                headers=headers,
+            )
+            if key_response.status_code != 200:
+                return _http_probe_failure(key_response.status_code)
+            model_response = await client.get(
+                f"https://openrouter.ai/api/v1/model/{model_name}",
+                headers=headers,
+            )
+            if model_response.status_code != 200:
+                return _http_probe_failure(model_response.status_code)
+    except (httpx.TimeoutException, httpx.NetworkError):
+        return ModelProbe(
+            "degraded",
+            "provider_unavailable",
+            "OpenRouter could not be reached",
+        )
+    return ModelProbe(
+        "available",
+        None,
+        "OpenRouter accepted the API key and advertises the configured model",
+    )
+
+
+def _http_probe_failure(status_code: int) -> ModelProbe:
+    if status_code in {401, 402, 403}:
+        return ModelProbe(
+            "unavailable",
+            "provider_access_denied",
+            "OpenRouter access is unavailable for this API key",
+        )
+    if status_code == 404:
+        return ModelProbe(
+            "unavailable",
+            "model_not_found",
+            "OpenRouter does not advertise the configured model",
+        )
+    if status_code == 429:
+        return ModelProbe(
+            "degraded",
+            "model_rate_limited",
+            "OpenRouter is rate limited",
+        )
+    return ModelProbe(
+        "degraded",
+        "provider_unavailable",
+        "OpenRouter availability could not be confirmed",
+    )
 
 
 def _is_transient_model_error(exc: Exception) -> bool:

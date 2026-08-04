@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from hashlib import sha256
 from pathlib import Path
@@ -10,13 +11,13 @@ from uuid import uuid4
 from pydantic_evals.reporting import EvaluationReportAdapter, ReportCaseAdapter
 
 from voice_ai.agent.eval_models import EvalCaseResult, EvalRun
-from voice_ai.agent.evals import EvalGateResult, load_eval_suite
+from voice_ai.agent.evals import EvalGateResult
 from voice_ai.agent.persistence.database import Database
-from voice_ai.shared.config import Settings
+from voice_ai.shared.config import AgentSettings
 
 
 async def persist_eval_run(
-    settings: Settings,
+    settings: AgentSettings,
     result: EvalGateResult,
     *,
     live: bool,
@@ -24,9 +25,9 @@ async def persist_eval_run(
 ) -> str:
     """Persist an immutable experiment plus queryable per-case projections."""
 
-    suite_bytes, suite = await asyncio.gather(
+    suite_bytes, suite_document = await asyncio.gather(
         asyncio.to_thread(suite_path.read_bytes),
-        asyncio.to_thread(load_eval_suite, suite_path),
+        asyncio.to_thread(_load_suite_document, suite_path),
     )
     run_id = f"evalrun_{uuid4().hex}"
     mode = "live" if live else "contract"
@@ -34,17 +35,23 @@ async def persist_eval_run(
     report_json = EvaluationReportAdapter.dump_python(result.report, mode="json")
     config_json = {
         "suite_path": str(suite_path),
-        "minimum_assertion_pass_rate": suite.minimum_assertion_pass_rate,
+        "minimum_assertion_pass_rate": suite_document["minimum_assertion_pass_rate"],
         "agent_model": model,
         "agent_fallback_models": settings.agent_fallback_models if live else [],
         "agent_subagent_model": settings.agent_subagent_model if live else None,
         "agent_thinking_effort": settings.agent_thinking_effort if live else None,
+        "agent_deep_thinking_effort": (settings.agent_deep_thinking_effort if live else None),
+        "agent_eval_judge_model": settings.agent_eval_judge_model if live else None,
         "agent_deep_agents_enabled": settings.agent_deep_agents_enabled if live else None,
+        "agent_planning_enabled": settings.agent_planning_enabled if live else None,
         "limits": {
             "requests": settings.agent_request_limit,
             "tool_calls": settings.agent_tool_call_limit,
             "total_tokens": settings.agent_total_token_limit,
             "max_output_tokens": settings.agent_max_output_tokens,
+            "subagent_requests": settings.agent_subagent_request_limit,
+            "subagent_tool_calls": settings.agent_subagent_tool_call_limit,
+            "subagent_total_tokens": settings.agent_subagent_total_token_limit,
         },
     }
     database = Database(settings.database_url)
@@ -53,7 +60,7 @@ async def persist_eval_run(
             session.add(
                 EvalRun(
                     id=run_id,
-                    suite_name=f"agent-service-{result.suite_version}",
+                    suite_name=f"{result.suite_name}-{result.suite_version}",
                     suite_version=result.suite_version,
                     dataset_digest=sha256(suite_bytes).hexdigest(),
                     mode=mode,
@@ -66,9 +73,7 @@ async def persist_eval_run(
                     started_at=result.started_at,
                     completed_at=result.completed_at,
                     duration_ms=result.duration_ms,
-                    source_revision=(
-                        os.getenv("GITHUB_SHA") or os.getenv("CI_COMMIT_SHA")
-                    ),
+                    source_revision=(os.getenv("GITHUB_SHA") or os.getenv("CI_COMMIT_SHA")),
                     trace_id=result.report.trace_id,
                     span_id=result.report.span_id,
                     config_json=config_json,
@@ -84,9 +89,10 @@ async def persist_eval_run(
                 sequence += 1
                 case_json = ReportCaseAdapter.dump_python(case, mode="json")
                 assertions = case_json.get("assertions") or {}
-                passed = all(
-                    _evaluation_value(value) is True for value in assertions.values()
-                ) and not case.evaluator_failures
+                passed = (
+                    all(_evaluation_value(value) is True for value in assertions.values())
+                    and not case.evaluator_failures
+                )
                 session.add(
                     EvalCaseResult(
                         run_id=run_id,
@@ -135,6 +141,13 @@ async def persist_eval_run(
     finally:
         await database.close()
     return run_id
+
+
+def _load_suite_document(path: Path) -> dict[str, Any]:
+    document = json.loads(path.read_text())
+    if not isinstance(document, dict):
+        raise ValueError("Evaluation suite must be a JSON object")
+    return document
 
 
 def _evaluation_value(value: Any) -> Any:

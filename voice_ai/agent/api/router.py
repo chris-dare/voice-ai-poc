@@ -1,7 +1,6 @@
 import asyncio
-from collections import defaultdict, deque
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
@@ -15,6 +14,7 @@ from voice_ai.agent.api.auth import (
     AuthFailure,
     require_scopes,
 )
+from voice_ai.agent.api.models import RateLimitBucket
 from voice_ai.agent.api.schemas import (
     ConversationCreateRequest,
     RequiredActionDecision,
@@ -27,30 +27,58 @@ from voice_ai.agent.api.services import (
 )
 
 
-class FixedWindowRateLimiter:
-    def __init__(self, requests_per_minute: int) -> None:
+class SharedFixedWindowRateLimiter:
+    """Database-backed limiter with one authoritative counter across replicas."""
+
+    def __init__(self, service: AgentApiService, requests_per_minute: int) -> None:
+        self._database = service.database
         self._limit = requests_per_minute
-        self._requests: dict[tuple[str, str], deque[float]] = defaultdict(deque)
-        self._lock = asyncio.Lock()
 
     async def check(self, auth: AuthContext) -> dict[str, str]:
-        now = datetime.now(UTC).timestamp()
-        key = (auth.tenant_id, auth.subject_id)
-        async with self._lock:
-            requests = self._requests[key]
-            while requests and requests[0] <= now - 60:
-                requests.popleft()
-            if len(requests) >= self._limit:
-                retry_after = max(1, int(60 - (now - requests[0])) + 1)
-                raise ApiProblem(
-                    429,
-                    "rate_limit_exceeded",
-                    "The request rate limit has been exceeded.",
-                    extensions={"retry_after": retry_after},
-                )
-            requests.append(now)
-            remaining = max(0, self._limit - len(requests))
-            reset = max(1, int(60 - (now - requests[0])) + 1)
+        now = datetime.now(UTC)
+        window_started_at = now.replace(second=0, microsecond=0)
+        expires_at = window_started_at + timedelta(minutes=2)
+        values = {
+            "tenant_id": auth.tenant_id,
+            "subject_id": auth.subject_id,
+            "window_started_at": window_started_at,
+            "request_count": 1,
+            "expires_at": expires_at,
+        }
+        dialect = self._database.engine.dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert
+        else:  # pragma: no cover - production and tests use PostgreSQL/SQLite
+            raise RuntimeError(f"Unsupported rate-limit database dialect: {dialect}")
+        statement = (
+            insert(RateLimitBucket)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=[
+                    RateLimitBucket.tenant_id,
+                    RateLimitBucket.subject_id,
+                    RateLimitBucket.window_started_at,
+                ],
+                set_={
+                    "request_count": RateLimitBucket.request_count + 1,
+                    "expires_at": expires_at,
+                },
+            )
+            .returning(RateLimitBucket.request_count)
+        )
+        async with self._database.session_factory.begin() as session:
+            count = int((await session.exec(statement)).one()[0])
+        reset = max(1, int((window_started_at + timedelta(minutes=1) - now).total_seconds()) + 1)
+        if count > self._limit:
+            raise ApiProblem(
+                429,
+                "rate_limit_exceeded",
+                "The request rate limit has been exceeded.",
+                extensions={"retry_after": reset},
+            )
+        remaining = max(0, self._limit - count)
         return {
             "RateLimit-Limit": str(self._limit),
             "RateLimit-Remaining": str(remaining),
@@ -65,7 +93,7 @@ def create_api_router(
     requests_per_minute: int,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1")
-    limiter = FixedWindowRateLimiter(requests_per_minute)
+    limiter = SharedFixedWindowRateLimiter(service, requests_per_minute)
     bearer = HTTPBearer(
         auto_error=False,
         scheme_name="Auth0Bearer",
@@ -74,9 +102,7 @@ def create_api_router(
 
     async def authorize(
         request: Request,
-        credentials: Annotated[
-            HTTPAuthorizationCredentials | None, Depends(bearer)
-        ],
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     ) -> AuthContext:
         if verifier is None:
             raise ApiProblem(
@@ -99,6 +125,13 @@ def create_api_router(
             raise ApiProblem(exc.status_code, exc.code, exc.detail) from exc
         request.state.rate_limit_headers = await limiter.check(auth)
         return auth
+
+    @router.get("/models")
+    async def list_models(
+        auth: Annotated[AuthContext, Depends(authorize)],
+    ) -> JSONResponse:
+        _scopes(auth, "agents:invoke")
+        return JSONResponse(await service.list_models())
 
     @router.post("/conversations")
     async def create_conversation(
@@ -131,9 +164,7 @@ def create_api_router(
         after: Annotated[str | None, Query(max_length=1000)] = None,
     ) -> JSONResponse:
         _scopes(auth, "conversations:read")
-        return JSONResponse(
-            await service.list_conversations(auth, limit=limit, after=after)
-        )
+        return JSONResponse(await service.list_conversations(auth, limit=limit, after=after))
 
     @router.get("/conversations/{conversation_id}")
     async def get_conversation(
@@ -167,9 +198,7 @@ def create_api_router(
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> Response:
         _scopes(auth, "conversations:delete")
-        replayed = await service.delete_conversation(
-            auth, conversation_id, idempotency_key
-        )
+        replayed = await service.delete_conversation(auth, conversation_id, idempotency_key)
         headers = {"Idempotent-Replayed": "true"} if replayed else {}
         return Response(status_code=204, headers=headers)
 
@@ -184,15 +213,11 @@ def create_api_router(
         _scopes(auth, "agents:invoke")
         _validate_accept(payload.stream, accept)
         try:
-            response, replayed = await service.create_response(
-                auth, payload, idempotency_key
-            )
+            response, replayed = await service.create_response(auth, payload, idempotency_key)
         except IntegrityError as exc:
             if idempotency_key:
                 await asyncio.sleep(0)
-                response, replayed = await service.create_response(
-                    auth, payload, idempotency_key
-                )
+                response, replayed = await service.create_response(auth, payload, idempotency_key)
             elif payload.conversation_id:
                 raise ApiProblem(
                     409,
@@ -224,9 +249,7 @@ def create_api_router(
                     "X-Accel-Buffering": "no",
                 },
             )
-        if payload.background or (
-            replayed and response["status"] in ACTIVE_STATUSES
-        ):
+        if payload.background or (replayed and response["status"] in ACTIVE_STATUSES):
             return JSONResponse(
                 response,
                 status_code=202,
@@ -255,9 +278,7 @@ def create_api_router(
     ) -> StreamingResponse:
         _scopes(auth, "responses:read")
         if accept and not _accepts(accept, "text/event-stream"):
-            raise ApiProblem(
-                406, "not_acceptable", "This endpoint produces text/event-stream."
-            )
+            raise ApiProblem(406, "not_acceptable", "This endpoint produces text/event-stream.")
         after = _event_cursor(last_event_id)
         # Validate ownership and cursor before sending the 200 response.
         await service.event_page(auth, response_id, after)
@@ -277,9 +298,7 @@ def create_api_router(
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> JSONResponse:
         _scopes(auth, "responses:cancel")
-        response, replayed = await service.cancel_response(
-            auth, response_id, idempotency_key
-        )
+        response, replayed = await service.cancel_response(auth, response_id, idempotency_key)
         return JSONResponse(
             response,
             headers={"Idempotent-Replayed": "true"} if replayed else {},
@@ -380,7 +399,9 @@ def _event_cursor(value: str | None) -> int:
     try:
         cursor = int(value)
     except ValueError as exc:
-        raise ApiProblem(409, "event_cursor_expired", "Last-Event-ID must be a decimal integer.") from exc
+        raise ApiProblem(
+            409, "event_cursor_expired", "Last-Event-ID must be a decimal integer."
+        ) from exc
     if cursor < 0:
         raise ApiProblem(409, "event_cursor_expired", "Last-Event-ID cannot be negative.")
     return cursor

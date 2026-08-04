@@ -127,14 +127,11 @@ class _NativeChunkStream:
                             "tool_calls": [
                                 {
                                     "index": int(function.get("index", index)),
-                                    "id": tool_call.get("id")
-                                    or f"call_{uuid4().hex[:12]}",
+                                    "id": tool_call.get("id") or f"call_{uuid4().hex[:12]}",
                                     "type": "function",
                                     "function": {
                                         "name": function.get("name", ""),
-                                        "arguments": json.dumps(
-                                            function.get("arguments") or {}
-                                        ),
+                                        "arguments": json.dumps(function.get("arguments") or {}),
                                     },
                                 }
                             ]
@@ -208,9 +205,7 @@ def _completion_chunk(
             "created": int(time.time()),
             "model": model,
             "choices": (
-                [{"index": 0, "delta": delta, "finish_reason": None}]
-                if delta is not None
-                else []
+                [{"index": 0, "delta": delta, "finish_reason": None}] if delta is not None else []
             ),
             "usage": usage,
         }

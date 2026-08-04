@@ -29,15 +29,14 @@ class Conversation(TableModel, table=True):
     subject_id: str = Field(sa_type=String(255), nullable=False)
     subscriber_id: UUID | None = Field(default=None, nullable=True)
     agent_id: str = Field(sa_type=String(120), nullable=False)
+    model_id: str = Field(sa_type=String(255), nullable=False)
     status: str = Field(sa_type=String(24), nullable=False)
     metadata_json: dict[str, Any] = Field(sa_type=JSON, nullable=False)
     session_state: dict[str, Any] = Field(sa_type=JSON, nullable=False)
     created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
     updated_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
 
-    __table_args__ = (
-        Index("ix_api_conversations_owner", "tenant_id", "subject_id", "updated_at"),
-    )
+    __table_args__ = (Index("ix_api_conversations_owner", "tenant_id", "subject_id", "updated_at"),)
 
 
 class ResponseRecord(TableModel, table=True):
@@ -56,6 +55,7 @@ class ResponseRecord(TableModel, table=True):
     subject_id: str = Field(sa_type=String(255), nullable=False)
     subscriber_id: UUID | None = Field(default=None, nullable=True)
     agent_id: str = Field(sa_type=String(120), nullable=False)
+    model_id: str = Field(sa_type=String(255), nullable=False)
     status: str = Field(sa_type=String(24), nullable=False)
     created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
     started_at: datetime | None = Field(
@@ -64,15 +64,11 @@ class ResponseRecord(TableModel, table=True):
     completed_at: datetime | None = Field(
         default=None, sa_type=DateTime(timezone=True), nullable=True
     )
-    cancellation_reason: str | None = Field(
-        default=None, sa_type=String(64), nullable=True
-    )
+    cancellation_reason: str | None = Field(default=None, sa_type=String(64), nullable=True)
     input_json: list[dict[str, Any]] = Field(sa_type=JSON, nullable=False)
     session_state: dict[str, Any] = Field(sa_type=JSON, nullable=False)
     output_json: list[dict[str, Any]] = Field(sa_type=JSON, nullable=False)
-    required_action_json: dict[str, Any] | None = Field(
-        default=None, sa_type=JSON, nullable=True
-    )
+    required_action_json: dict[str, Any] | None = Field(default=None, sa_type=JSON, nullable=True)
     error_json: dict[str, Any] | None = Field(default=None, sa_type=JSON, nullable=True)
     usage_json: dict[str, Any] | None = Field(default=None, sa_type=JSON, nullable=True)
     metadata_json: dict[str, Any] = Field(sa_type=JSON, nullable=False)
@@ -111,9 +107,91 @@ class ResponseEvent(TableModel, table=True):
     created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
     data_json: dict[str, Any] = Field(sa_type=JSON, nullable=False)
 
-    __table_args__ = (
-        Index("ix_api_response_events_created", "created_at"),
+    __table_args__ = (Index("ix_api_response_events_created", "created_at"),)
+
+
+class ResponseJob(TableModel, table=True):
+    """Durable, lease-based execution record for an accepted response."""
+
+    __tablename__ = "api_response_jobs"
+
+    response_id: str = Field(
+        sa_type=String(64),
+        foreign_key="api_responses.id",
+        ondelete="CASCADE",
+        primary_key=True,
     )
+    status: str = Field(sa_type=String(24), nullable=False)
+    decision: str | None = Field(default=None, sa_type=String(16), nullable=True)
+    attempt_count: int = Field(default=0, sa_type=Integer, nullable=False)
+    max_attempts: int = Field(default=3, sa_type=Integer, nullable=False)
+    available_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    lease_owner: str | None = Field(default=None, sa_type=String(255), nullable=True)
+    lease_expires_at: datetime | None = Field(
+        default=None, sa_type=DateTime(timezone=True), nullable=True
+    )
+    heartbeat_at: datetime | None = Field(
+        default=None, sa_type=DateTime(timezone=True), nullable=True
+    )
+    created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    updated_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_api_response_jobs_claim",
+            "status",
+            "available_at",
+            "lease_expires_at",
+        ),
+    )
+
+
+class RateLimitBucket(TableModel, table=True):
+    """Shared fixed-window request counter used by every API replica."""
+
+    __tablename__ = "api_rate_limit_buckets"
+
+    tenant_id: str = Field(sa_type=String(255), primary_key=True)
+    subject_id: str = Field(sa_type=String(255), primary_key=True)
+    window_started_at: datetime = Field(sa_type=DateTime(timezone=True), primary_key=True)
+    request_count: int = Field(default=0, sa_type=Integer, nullable=False)
+    expires_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("ix_api_rate_limit_expiry", "expires_at"),)
+
+
+class WorkerNode(TableModel, table=True):
+    """Liveness record for an independently deployed response worker."""
+
+    __tablename__ = "api_worker_nodes"
+
+    id: str = Field(sa_type=String(255), primary_key=True)
+    status: str = Field(sa_type=String(24), nullable=False)
+    concurrency: int = Field(sa_type=Integer, nullable=False)
+    started_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    heartbeat_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("ix_api_worker_nodes_heartbeat", "status", "heartbeat_at"),)
+
+
+class ModelAvailability(TableModel, table=True):
+    """Shared provider/model health observed by all API and worker replicas."""
+
+    __tablename__ = "api_model_availability"
+
+    model_id: str = Field(sa_type=String(255), primary_key=True)
+    status: str = Field(sa_type=String(24), nullable=False)
+    reason_code: str | None = Field(default=None, sa_type=String(80), nullable=True)
+    detail: str | None = Field(default=None, sa_type=String(500), nullable=True)
+    checked_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    last_success_at: datetime | None = Field(
+        default=None, sa_type=DateTime(timezone=True), nullable=True
+    )
+    last_failure_at: datetime | None = Field(
+        default=None, sa_type=DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (Index("ix_api_model_availability_status", "status", "checked_at"),)
 
 
 class RequiredAction(TableModel, table=True):
@@ -139,9 +217,7 @@ class RequiredAction(TableModel, table=True):
     )
     created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
 
-    __table_args__ = (
-        Index("ix_api_required_actions_expiry", "expires_at", "decision"),
-    )
+    __table_args__ = (Index("ix_api_required_actions_expiry", "expires_at", "decision"),)
 
 
 class IdempotencyRecord(TableModel, table=True):

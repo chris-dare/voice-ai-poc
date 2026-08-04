@@ -61,9 +61,7 @@ class EvalCaseResult(TableModel, table=True):
     )
     sequence_number: int = Field(sa_type=Integer, primary_key=True)
     case_name: str = Field(sa_type=String(255), nullable=False)
-    source_case_name: str | None = Field(
-        default=None, sa_type=String(255), nullable=True
-    )
+    source_case_name: str | None = Field(default=None, sa_type=String(255), nullable=True)
     status: str = Field(sa_type=String(24), nullable=False)
     task_duration_ms: float | None = Field(default=None, sa_type=Float, nullable=True)
     total_duration_ms: float | None = Field(default=None, sa_type=Float, nullable=True)
@@ -73,9 +71,7 @@ class EvalCaseResult(TableModel, table=True):
     assertions_json: dict[str, Any] = Field(sa_type=JSON_DOCUMENT, nullable=False)
     scores_json: dict[str, Any] = Field(sa_type=JSON_DOCUMENT, nullable=False)
     metrics_json: dict[str, Any] = Field(sa_type=JSON_DOCUMENT, nullable=False)
-    error_json: dict[str, Any] | None = Field(
-        default=None, sa_type=JSON_DOCUMENT, nullable=True
-    )
+    error_json: dict[str, Any] | None = Field(default=None, sa_type=JSON_DOCUMENT, nullable=True)
     case_json: dict[str, Any] = Field(sa_type=JSON_DOCUMENT, nullable=False)
 
     __table_args__ = (

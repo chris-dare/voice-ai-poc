@@ -20,8 +20,30 @@ from voice_ai.agent.persistence.model import TableModel
 class Database:
     """Owns the agent service's async database engine and sessions."""
 
-    def __init__(self, url: str, *, echo: bool = False) -> None:
-        self.engine: AsyncEngine = create_async_engine(url, echo=echo, pool_pre_ping=True)
+    def __init__(
+        self,
+        url: str,
+        *,
+        echo: bool = False,
+        pool_size: int = 10,
+        max_overflow: int = 20,
+        pool_timeout: int = 30,
+    ) -> None:
+        pool_options = (
+            {}
+            if url.startswith("sqlite")
+            else {
+                "pool_size": pool_size,
+                "max_overflow": max_overflow,
+                "pool_timeout": pool_timeout,
+            }
+        )
+        self.engine: AsyncEngine = create_async_engine(
+            url,
+            echo=echo,
+            pool_pre_ping=True,
+            **pool_options,
+        )
         self.session_factory = async_sessionmaker(
             self.engine,
             class_=AsyncSession,
