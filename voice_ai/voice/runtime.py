@@ -13,7 +13,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
 )
 from pipecat.workers.runner import WorkerRunner
 
-from voice_ai.shared.config import Settings
+from voice_ai.shared.config import VoiceSettings
 from voice_ai.voice.health import overall_status, run_voice_checks
 from voice_ai.voice.pipeline import create_voice_session, warm_tts_service
 
@@ -21,7 +21,7 @@ from voice_ai.voice.pipeline import create_voice_session, warm_tts_service
 class VoiceRuntime:
     """Heavy voice dependencies loaded outside the web UI startup path."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: VoiceSettings) -> None:
         self.settings = settings
         ice_servers = [
             IceServer(
@@ -62,10 +62,11 @@ class VoiceRuntime:
 async def run_session(
     *,
     connection: SmallWebRTCConnection,
-    settings: Settings,
+    settings: VoiceSettings,
     capacity: Any,
     public_access_token: str | None = None,
     conversation_id: str | None = None,
+    model_id: str | None = None,
 ) -> None:
     runner = WorkerRunner(handle_sigint=False, handle_sigterm=False)
     try:
@@ -74,6 +75,7 @@ async def run_session(
             settings=settings,
             public_access_token=public_access_token,
             conversation_id=conversation_id,
+            model_id=model_id,
         )
         await runner.add_workers(session.worker)
         runner_task = asyncio.create_task(runner.run())

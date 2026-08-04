@@ -34,6 +34,7 @@ class RemoteAgentLLMService(LLMService):
         on_event,
         public_access_token: str | None = None,
         conversation_id: str | None = None,
+        model_id: str | None = None,
     ) -> None:
         super().__init__(
             settings=LLMSettings(
@@ -54,6 +55,7 @@ class RemoteAgentLLMService(LLMService):
         self._session_id = session_id
         self._on_event = on_event
         self._conversation_id = conversation_id
+        self._model_id = model_id
         self._uses_authenticated_api = bool(public_access_token and conversation_id)
         self._pending_action: dict[str, str] | None = None
         self._active_response_id: str | None = None
@@ -94,11 +96,12 @@ class RemoteAgentLLMService(LLMService):
         payload = AgentTurnRequest(
             session_id=self._session_id,
             text=text,
+            model_id=self._model_id,
         )
         async with self._client.stream(
             "POST",
             f"{self._base_url}/v1/turns/stream",
-            json=payload.model_dump(mode="json"),
+            json=payload.model_dump(mode="json", exclude_none=True),
         ) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -121,37 +124,72 @@ class RemoteAgentLLMService(LLMService):
         if self._pending_action:
             return await self._resume_public_action(text)
 
-        stream_context = self._client.stream(
-            "POST",
-            f"{self._base_url}/v1/responses",
-            headers={
-                "Accept": "text/event-stream",
-                "Idempotency-Key": uuid4().hex,
-            },
-            json={
-                "conversation_id": self._conversation_id,
-                "input": text,
-                "stream": True,
-                "background": True,
-                "metadata": {"channel": "voice"},
-            },
-        )
         async with self._response_start_lock:
             await self._cancel_active_response()
-            response = await stream_context.__aenter__()
-            try:
-                response.raise_for_status()
-            except BaseException:
-                await stream_context.__aexit__(*sys.exc_info())
-                raise
-            response_id = response.headers.get("X-Response-Id")
+            stream_context, response, response_id = await self._start_public_response(text)
             self._active_response_id = response_id
         try:
             return await self._consume_public_events(response, response_id=response_id)
         finally:
+            cleanup = asyncio.create_task(self._finish_public_response(stream_context, response_id))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # Pipecat cancels the in-flight processor task on barge-in. Do
+                # not let that cancellation strand a background API response.
+                await cleanup
+                raise
+
+    async def _start_public_response(self, text: str) -> tuple[Any, httpx.Response, str | None]:
+        """Open a response stream, recovering once from a stale active response."""
+        if not self._model_id:
+            raise RuntimeError("A model selection is required for an authenticated voice turn")
+        for attempt in range(2):
+            payload: dict[str, Any] = {
+                "conversation_id": self._conversation_id,
+                "model": self._model_id,
+                "input": text,
+                "stream": True,
+                "background": True,
+                "metadata": {"channel": "voice"},
+            }
+            stream_context = self._client.stream(
+                "POST",
+                f"{self._base_url}/v1/responses",
+                headers={
+                    "Accept": "text/event-stream",
+                    "Idempotency-Key": uuid4().hex,
+                },
+                json=payload,
+            )
+            response = await stream_context.__aenter__()
+            if response.status_code != 409:
+                try:
+                    response.raise_for_status()
+                except BaseException:
+                    await stream_context.__aexit__(*sys.exc_info())
+                    raise
+                return stream_context, response, response.headers.get("X-Response-Id")
+
+            busy_response_id = await _conversation_busy_response_id(response)
             await stream_context.__aexit__(None, None, None)
+            if attempt == 0 and busy_response_id:
+                logger.info(
+                    "Cancelling stale agent response before retrying voice turn",
+                    response_id=busy_response_id,
+                )
+                await self._cancel_response(busy_response_id)
+                continue
+            response.raise_for_status()
+
+        raise RuntimeError("Agent response retry exhausted")
+
+    async def _finish_public_response(self, stream_context: Any, response_id: str | None) -> None:
+        try:
+            await stream_context.__aexit__(None, None, None)
+        finally:
             if response_id and self._active_response_id == response_id:
-                await asyncio.shield(self._cancel_response(response_id))
+                await self._cancel_response(response_id)
 
     async def _resume_public_action(self, text: str) -> bool:
         pending = self._pending_action
@@ -287,6 +325,19 @@ def _last_user_text(messages: list[dict[str, Any]]) -> str:
             if text:
                 return text
     raise ValueError("No user transcript was available for the agent")
+
+
+async def _conversation_busy_response_id(response: httpx.Response) -> str | None:
+    """Return the active response advertised by a conversation-busy problem."""
+    try:
+        await response.aread()
+        problem = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if problem.get("code") != "conversation_busy":
+        return None
+    response_id = problem.get("response_id")
+    return str(response_id) if response_id else None
 
 
 def _tool_message(event: dict[str, Any]) -> dict[str, Any]:

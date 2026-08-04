@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -13,10 +14,7 @@ from voice_ai.voice.agent_client import RemoteAgentLLMService
 def _sse(*events: dict) -> bytes:
     records = []
     for sequence, event in enumerate(events, start=1):
-        records.append(
-            f"id: {sequence}\nevent: {event['type']}\n"
-            f"data: {json.dumps(event)}\n\n"
-        )
+        records.append(f"id: {sequence}\nevent: {event['type']}\ndata: {json.dumps(event)}\n\n")
     return "".join(records).encode()
 
 
@@ -50,6 +48,7 @@ async def test_public_voice_turn_uses_durable_response_stream() -> None:
         shared_secret="private-secret",
         public_access_token="user-token",
         conversation_id="conv_test",
+        model_id="test:assistant",
         on_event=on_event,
     )
     await service._client.aclose()
@@ -69,6 +68,7 @@ async def test_public_voice_turn_uses_durable_response_stream() -> None:
     assert requests[0].headers["authorization"] == "Bearer user-token"
     assert json.loads(requests[0].content) == {
         "conversation_id": "conv_test",
+        "model": "test:assistant",
         "input": "What's my balance?",
         "stream": True,
         "background": True,
@@ -121,6 +121,7 @@ async def test_public_voice_confirmation_resumes_the_same_response() -> None:
         shared_secret=None,
         public_access_token="user-token",
         conversation_id="conv_test",
+        model_id="test:assistant",
         on_event=AsyncMock(),
     )
     await service._client.aclose()
@@ -154,9 +155,7 @@ async def test_public_voice_confirmation_cancels_incomplete_resumed_stream() -> 
             return httpx.Response(
                 200,
                 headers={"Content-Type": "text/event-stream"},
-                content=_sse(
-                    {"type": "response.output_text.delta", "delta": "Partial change"}
-                ),
+                content=_sse({"type": "response.output_text.delta", "delta": "Partial change"}),
             )
         assert request.url.path == "/v1/responses/resp_test/cancel"
         return httpx.Response(200, json={"id": "resp_test", "status": "cancelled"})
@@ -167,6 +166,7 @@ async def test_public_voice_confirmation_cancels_incomplete_resumed_stream() -> 
         shared_secret=None,
         public_access_token="user-token",
         conversation_id="conv_test",
+        model_id="test:assistant",
         on_event=AsyncMock(),
     )
     await service._client.aclose()
@@ -221,6 +221,7 @@ async def test_public_voice_turn_cancels_a_lingering_response_before_barge_in() 
         shared_secret=None,
         public_access_token="user-token",
         conversation_id="conv_test",
+        model_id="test:assistant",
         on_event=AsyncMock(),
     )
     await service._client.aclose()
@@ -245,23 +246,36 @@ async def test_public_voice_turn_cancels_a_lingering_response_before_barge_in() 
 
 
 @pytest.mark.asyncio
-async def test_public_voice_turn_cancels_stream_that_ends_without_terminal_event() -> None:
+async def test_public_voice_turn_recovers_from_conversation_busy_race() -> None:
     requests: list[httpx.Request] = []
+    response_attempt = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal response_attempt
         requests.append(request)
-        if request.url.path == "/v1/responses/resp_incomplete/cancel":
+        if request.url.path == "/v1/responses/resp_busy/cancel":
+            return httpx.Response(200, json={"id": "resp_busy", "status": "cancelled"})
+        assert request.url.path == "/v1/responses"
+        response_attempt += 1
+        if response_attempt == 1:
             return httpx.Response(
-                200, json={"id": "resp_incomplete", "status": "cancelled"}
+                409,
+                headers={"Content-Type": "application/problem+json"},
+                json={
+                    "code": "conversation_busy",
+                    "response_id": "resp_busy",
+                    "detail": "The conversation already has an active response.",
+                },
             )
         return httpx.Response(
             200,
             headers={
                 "Content-Type": "text/event-stream",
-                "X-Response-Id": "resp_incomplete",
+                "X-Response-Id": "resp_new",
             },
             content=_sse(
-                {"type": "response.output_text.delta", "delta": "Partial answer"}
+                {"type": "response.output_text.delta", "delta": "Complete answer"},
+                {"type": "response.completed"},
             ),
         )
 
@@ -271,6 +285,122 @@ async def test_public_voice_turn_cancels_stream_that_ends_without_terminal_event
         shared_secret=None,
         public_access_token="user-token",
         conversation_id="conv_test",
+        model_id="test:assistant",
+        on_event=AsyncMock(),
+    )
+    await service._client.aclose()
+    service._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer user-token"},
+    )
+    service.stop_ttfb_metrics = AsyncMock()
+    service._push_llm_text = AsyncMock()
+    try:
+        first_text = await service._process_public_turn("Use my complete question")
+    finally:
+        await service._client.aclose()
+
+    assert first_text is False
+    assert [request.url.path for request in requests] == [
+        "/v1/responses",
+        "/v1/responses/resp_busy/cancel",
+        "/v1/responses",
+    ]
+    service._push_llm_text.assert_awaited_once_with("Complete answer")
+
+
+class _BlockingEventStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self):
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.closed.set()
+        if False:
+            yield b""
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_voice_stream_still_cancels_background_agent_response() -> None:
+    requests: list[httpx.Request] = []
+    stream = _BlockingEventStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/responses/resp_active/cancel":
+            return httpx.Response(200, json={"id": "resp_active", "status": "cancelled"})
+        assert request.url.path == "/v1/responses"
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "X-Response-Id": "resp_active",
+            },
+            stream=stream,
+        )
+
+    service = RemoteAgentLLMService(
+        base_url="http://agent.test",
+        session_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        shared_secret=None,
+        public_access_token="user-token",
+        conversation_id="conv_test",
+        model_id="test:assistant",
+        on_event=AsyncMock(),
+    )
+    await service._client.aclose()
+    service._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer user-token"},
+    )
+    task = asyncio.create_task(service._process_public_turn("First fragment"))
+    try:
+        await asyncio.wait_for(stream.started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        await service._client.aclose()
+
+    assert stream.closed.is_set()
+    assert [request.url.path for request in requests] == [
+        "/v1/responses",
+        "/v1/responses/resp_active/cancel",
+    ]
+    assert service._active_response_id is None
+
+
+@pytest.mark.asyncio
+async def test_public_voice_turn_cancels_stream_that_ends_without_terminal_event() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/responses/resp_incomplete/cancel":
+            return httpx.Response(200, json={"id": "resp_incomplete", "status": "cancelled"})
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "X-Response-Id": "resp_incomplete",
+            },
+            content=_sse({"type": "response.output_text.delta", "delta": "Partial answer"}),
+        )
+
+    service = RemoteAgentLLMService(
+        base_url="http://agent.test",
+        session_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        shared_secret=None,
+        public_access_token="user-token",
+        conversation_id="conv_test",
+        model_id="test:assistant",
         on_event=AsyncMock(),
     )
     await service._client.aclose()

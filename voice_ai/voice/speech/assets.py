@@ -11,12 +11,10 @@ KOKORO_MODEL_URL = (
     "releases/download/model-files-v1.0/kokoro-v1.0.onnx"
 )
 KOKORO_VOICES_URL = (
-    "https://github.com/thewh1teagle/kokoro-onnx/"
-    "releases/download/model-files-v1.0/voices-v1.0.bin"
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 )
 PUNKT_TAB_URL = (
-    "https://raw.githubusercontent.com/nltk/nltk_data/"
-    "gh-pages/packages/tokenizers/punkt_tab.zip"
+    "https://raw.githubusercontent.com/nltk/nltk_data/gh-pages/packages/tokenizers/punkt_tab.zip"
 )
 PUNKT_TAB_SHA256 = "e57f64187974277726a3417ca6f181ec5403676c717672eef6a748a7b20e0106"
 
