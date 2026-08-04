@@ -16,6 +16,7 @@ services:
       - postgres-data:/var/lib/postgresql/data
     ports:
       - "55432:5432"
+    restart: unless-stopped
 
   postgres-test:
     image: postgres:17-alpine
@@ -54,7 +55,20 @@ services:
     environment:
       OLLAMA_HOST: http://ollama:11434
     entrypoint: ["ollama"]
-    command: ["pull", "${OLLAMA_MODEL:-qwen3:1.7b}"]
+    command: ["pull", "${OLLAMA_MODEL:?OLLAMA_MODEL must be set}"]
+    restart: "no"
+
+  migrate:
+    build:
+      context: .
+      args:
+        WHISPER_MODEL: ${WHISPER_MODEL:-base}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://voice_ai:voice_ai@postgres:5432/voice_ai
+    command: ["migrate"]
     restart: "no"
 
   agent:
@@ -62,21 +76,20 @@ services:
       context: .
       args:
         WHISPER_MODEL: ${WHISPER_MODEL:-base}
-        PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       ollama-init:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql+asyncpg://voice_ai:voice_ai@postgres:5432/voice_ai
       OLLAMA_BASE_URL: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:1.7b}
-      WHISPER_MODEL: ${WHISPER_MODEL:-base}
-      TTS_PROVIDER: ${TTS_PROVIDER:-kokoro}
-      KOKORO_VOICE: ${KOKORO_VOICE:-af_heart}
-      PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}
-      MODEL_CACHE_DIR: /app/models
+      AGENT_MODEL: ${AGENT_MODEL:?AGENT_MODEL must be set}
+      AGENT_MODELS: ${AGENT_MODELS:-[]}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      AGENT_GATEWAY_BASE_URL: ${AGENT_GATEWAY_BASE_URL:-}
+      AGENT_GATEWAY_API_KEY: ${AGENT_GATEWAY_API_KEY:-}
+      AGENT_EMBEDDED_WORKER: "false"
       AGENT_HOST: 0.0.0.0
       AGENT_PORT: 8100
       AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:-local-agent-secret}
@@ -101,13 +114,40 @@ services:
       interval: 3s
       timeout: 5s
       retries: 30
+    restart: unless-stopped
+
+  agent-worker:
+    build:
+      context: .
+      args:
+        WHISPER_MODEL: ${WHISPER_MODEL:-base}
+    depends_on:
+      agent:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://voice_ai:voice_ai@postgres:5432/voice_ai
+      OLLAMA_BASE_URL: http://ollama:11434
+      AGENT_MODEL: ${AGENT_MODEL:?AGENT_MODEL must be set}
+      AGENT_MODELS: ${AGENT_MODELS:-[]}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      AGENT_GATEWAY_BASE_URL: ${AGENT_GATEWAY_BASE_URL:-}
+      AGENT_GATEWAY_API_KEY: ${AGENT_GATEWAY_API_KEY:-}
+      API_ENABLED: ${API_ENABLED:-false}
+      API_AGENT_ID: ${API_AGENT_ID:-agent_general_assistant}
+      AUTH0_DOMAIN: ${AUTH0_DOMAIN:-}
+      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE:-}
+      LOGFIRE_ENABLED: ${LOGFIRE_ENABLED:-false}
+      LOGFIRE_ENVIRONMENT: ${LOGFIRE_ENVIRONMENT:-development}
+      LOGFIRE_CAPTURE_CONTENT: ${LOGFIRE_CAPTURE_CONTENT:-false}
+      LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
+    command: ["worker"]
+    restart: unless-stopped
 
   voice-gateway:
     build:
       context: .
       args:
         WHISPER_MODEL: ${WHISPER_MODEL:-base}
-        PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}
     depends_on:
       agent:
         condition: service_healthy
@@ -115,9 +155,7 @@ services:
       AGENT_BASE_URL: http://agent:8100
       AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:-local-agent-secret}
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
-      TTS_PROVIDER: ${TTS_PROVIDER:-kokoro}
       KOKORO_VOICE: ${KOKORO_VOICE:-af_heart}
-      PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}
       MODEL_CACHE_DIR: /app/models
       FRONTEND_DIST: /app/frontend/dist
       DEPLOYMENT_PROFILE: laptop
@@ -134,6 +172,7 @@ services:
     command: ["voice"]
     ports:
       - "7860:7860"
+    restart: unless-stopped
 
   coturn:
     image: coturn/coturn:4.6.3

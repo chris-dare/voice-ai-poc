@@ -11,13 +11,13 @@ from voice_ai.agent import eval_models as _eval_models  # noqa: F401
 from voice_ai.agent.api import models as _api_models  # noqa: F401
 from voice_ai.agent.persistence.model import TableModel
 from voice_ai.agent.telco import models as _telco_models  # noqa: F401
-from voice_ai.shared.config import get_settings
+from voice_ai.shared.config import get_agent_settings
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+config.set_main_option("sqlalchemy.url", get_agent_settings().database_url)
 target_metadata = TableModel.metadata
 
 

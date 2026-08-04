@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 import typer
@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from voice_ai.shared.config import get_settings
+from voice_ai.shared.config import get_agent_settings, get_settings, get_voice_settings
 from voice_ai.shared.startup import PROCESS_STARTED_AT  # noqa: F401
 
 app = typer.Typer(
@@ -30,7 +30,7 @@ def serve(
     reload: bool = typer.Option(False, help="Reload on Python source changes."),
 ) -> None:
     """Serve the public voice gateway and bundled browser client."""
-    settings = get_settings()
+    settings = get_voice_settings()
     uvicorn.run(
         "voice_ai.voice.app:create_app",
         factory=True,
@@ -48,7 +48,7 @@ def agent(
     reload: bool = typer.Option(False, help="Reload on Python source changes."),
 ) -> None:
     """Serve the private Pydantic AI reasoning and tool service."""
-    settings = get_settings()
+    settings = get_agent_settings()
     uvicorn.run(
         "voice_ai.agent.app:create_agent_app",
         factory=True,
@@ -57,6 +57,39 @@ def agent(
         reload=reload,
         log_level=settings.log_level.lower(),
     )
+
+
+@app.command()
+def worker() -> None:
+    """Run the durable agent-response execution worker."""
+    asyncio.run(_run_worker())
+
+
+async def _run_worker() -> None:
+    from voice_ai.agent.api.services import AgentApiService
+    from voice_ai.agent.persistence.database import Database
+    from voice_ai.agent.runtime import AgentRuntime
+    from voice_ai.shared.observability import configure_observability, instrument_sqlalchemy
+
+    settings = get_agent_settings()
+    configure_observability(settings, service_name="voice-ai-agent-worker")
+    database = Database(
+        settings.database_url,
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+        pool_timeout=settings.database_pool_timeout_seconds,
+    )
+    instrument_sqlalchemy(database.engine)
+    runtime = AgentRuntime(settings)
+    service = AgentApiService(settings, database, runtime)
+    try:
+        await runtime.startup()
+        await service.startup(start_worker=False)
+        await service.run_worker_forever()
+    finally:
+        await service.shutdown()
+        await runtime.shutdown()
+        await database.close()
 
 
 @app.command()
@@ -75,7 +108,7 @@ async def _seed(reset_demo: bool) -> None:
     from voice_ai.agent.persistence.database import Database
     from voice_ai.migrations import upgrade_database
 
-    settings = get_settings()
+    settings = get_agent_settings()
     database = Database(settings.database_url)
     try:
         await upgrade_database()
@@ -97,25 +130,67 @@ def evals_command(
         Path | None,
         typer.Option(help="Path to a versioned evaluation suite JSON file."),
     ] = None,
+    modality: Annotated[
+        Literal["text", "voice"],
+        typer.Option(help="Evaluation contract to run."),
+    ] = "text",
+    judge_model: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Optional Pydantic AI model ID for case-specific answer-quality judging. "
+                "Used only with --live text evaluations."
+            )
+        ),
+    ] = None,
 ) -> None:
     """Run the agent-service evaluation release gate."""
     from voice_ai.agent.eval_persistence import persist_eval_run
-    from voice_ai.agent.evals import DEFAULT_SUITE_PATH, gate_summary, run_eval_gate
+    from voice_ai.agent.evals import (
+        DEFAULT_SUITE_PATH,
+        EvalPreflightError,
+        gate_summary,
+        run_eval_gate,
+    )
+    from voice_ai.agent.voice_evals import (
+        DEFAULT_VOICE_SUITE_PATH,
+        run_voice_eval_gate,
+    )
     from voice_ai.shared.observability import configure_observability, record_eval_run
 
-    settings = get_settings()
+    settings = get_agent_settings()
     configure_observability(settings, service_name="voice-ai-evals")
-    suite_path = suite or DEFAULT_SUITE_PATH
-    result = asyncio.run(
-        run_eval_gate(
-            settings,
-            live=live,
-            suite_path=suite_path,
-        )
-    )
-    run_id = asyncio.run(
-        persist_eval_run(settings, result, live=live, suite_path=suite_path)
-    )
+    if modality == "voice":
+        if live:
+            raise typer.BadParameter(
+                "Live voice evaluation requires recorded, consented audio fixtures and a "
+                "hardware-profile runner; use contract mode until those fixtures are configured."
+            )
+        suite_path = suite or DEFAULT_VOICE_SUITE_PATH
+        result = asyncio.run(run_voice_eval_gate(suite_path=suite_path))
+    else:
+        suite_path = suite or DEFAULT_SUITE_PATH
+        try:
+            result = asyncio.run(
+                run_eval_gate(
+                    settings,
+                    live=live,
+                    suite_path=suite_path,
+                    judge_model=judge_model,
+                )
+            )
+        except EvalPreflightError as exc:
+            console.print(
+                Panel.fit(
+                    f"[bold red]Live evaluation did not start.[/bold red]\n"
+                    f"Model: {exc.model}\nReason: {exc.detail}\n"
+                    "No evaluation cases or judge calls were made.",
+                    title="Model preflight",
+                    border_style="red",
+                )
+            )
+            raise typer.Exit(2) from exc
+    run_id = asyncio.run(persist_eval_run(settings, result, live=live, suite_path=suite_path))
     result.report.print(include_output=not result.passed, include_reasons=True)
     console.print(gate_summary(result, live=live))
     record_eval_run(
@@ -179,8 +254,10 @@ async def _apply_fixes(settings: Any, database: Any) -> None:
         ("Downloading the Whisper model", lambda: _download_whisper(settings.whisper_model)),
         ("Downloading the sentence tokenizer", lambda: _download_nltk(settings)),
         ("Downloading the Kokoro voice model", lambda: _download_kokoro(settings)),
-        ("Downloading the Piper voice", lambda: _download_piper(settings)),
-        ("Applying database migrations and restoring demo data", lambda: _repair_database(database)),
+        (
+            "Applying database migrations and restoring demo data",
+            lambda: _repair_database(database),
+        ),
     ]
     if settings.agent_model.startswith("ollama:"):
         actions.append(("Checking the configured Ollama model", lambda: _repair_ollama(settings)))
@@ -225,18 +302,6 @@ async def _download_whisper(model: str) -> None:
     await asyncio.to_thread(download_model, model)
 
 
-async def _download_piper(settings) -> None:
-    from piper.download_voices import download_voice
-
-    settings.piper_download_dir.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(
-        download_voice,
-        settings.piper_voice,
-        settings.piper_download_dir,
-        False,
-    )
-
-
 async def _download_nltk(settings) -> None:
     from voice_ai.voice.speech.assets import provision_punkt_tab
 
@@ -276,7 +341,6 @@ async def _smoke_check(settings: Any) -> Any:
         import numpy as np
         from faster_whisper import WhisperModel
         from kokoro_onnx import Kokoro
-        from piper import PiperVoice
 
         from voice_ai.agent.protocol import AgentTurnRequest, TextDelta, ToolStarted
         from voice_ai.agent.runtime import AgentRuntime
@@ -303,56 +367,39 @@ async def _smoke_check(settings: Any) -> Any:
                     AgentTurnRequest(
                         session_id=uuid4(),
                         text=(
-                            "Use the Python sandbox to calculate (19 * 23) - 46. "
-                            "Return the result."
+                            "Use the Python sandbox to calculate (19 * 23) - 46. Return the result."
                         ),
                     )
                 )
             ]
         finally:
             await runtime.shutdown()
-        if not any(
-            isinstance(event, ToolStarted) and event.tool == "run_code"
-            for event in events
-        ):
+        if not any(isinstance(event, ToolStarted) and event.tool == "run_code" for event in events):
             raise RuntimeError("The configured model did not use sandboxed code")
-        answer = "".join(
-            event.text for event in events if isinstance(event, TextDelta)
-        )
+        answer = "".join(event.text for event in events if isinstance(event, TextDelta))
         if "391" not in answer:
             raise RuntimeError("The configured model returned the wrong calculation result")
 
-        if settings.tts_provider == "kokoro":
-            model_path = settings.kokoro_download_dir / "kokoro-v1.0.onnx"
-            voices_path = settings.kokoro_download_dir / "voices-v1.0.bin"
-            voice = await asyncio.to_thread(Kokoro, str(model_path), str(voices_path))
-            audio_bytes = 0
-            async for samples, _sample_rate in voice.create_stream(
-                "System ready.",
-                voice=settings.kokoro_voice,
-                lang="en-us",
-                speed=1.0,
-            ):
-                audio_bytes += samples.nbytes
-        else:
-            voice_path = settings.piper_download_dir / f"{settings.piper_voice}.onnx"
-            voice = await asyncio.to_thread(PiperVoice.load, voice_path)
-
-            def synthesize() -> int:
-                return sum(
-                    len(chunk.audio_int16_bytes) for chunk in voice.synthesize("System ready.")
-                )
-
-            audio_bytes = await asyncio.to_thread(synthesize)
+        model_path = settings.kokoro_download_dir / "kokoro-v1.0.onnx"
+        voices_path = settings.kokoro_download_dir / "voices-v1.0.bin"
+        voice = await asyncio.to_thread(Kokoro, str(model_path), str(voices_path))
+        audio_bytes = 0
+        async for samples, _sample_rate in voice.create_stream(
+            "System ready.",
+            voice=settings.kokoro_voice,
+            lang="en-us",
+            speed=1.0,
+        ):
+            audio_bytes += samples.nbytes
         if audio_bytes == 0:
-            raise RuntimeError(f"{settings.tts_provider} produced no audio")
+            raise RuntimeError("Kokoro produced no audio")
 
         return CheckResult(
             "End-to-end smoke",
             "pass",
             (
                 f"Whisper inference, {settings.agent_model} tool execution, and "
-                f"{settings.tts_provider} synthesis succeeded"
+                "Kokoro synthesis succeeded"
             ),
         )
     except Exception as exc:

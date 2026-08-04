@@ -6,6 +6,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="$ROOT_DIR/.run"
 ENV_FILE="${VOICE_AI_ENV_FILE:-$ROOT_DIR/.env}"
 AGENT_PID=""
+WORKER_PID=""
 GATEWAY_PID=""
 
 cd "$ROOT_DIR"
@@ -23,8 +24,12 @@ cleanup() {
   if [[ -n "$AGENT_PID" ]] && kill -0 "$AGENT_PID" 2>/dev/null; then
     kill "$AGENT_PID" 2>/dev/null || true
   fi
+  if [[ -n "$WORKER_PID" ]] && kill -0 "$WORKER_PID" 2>/dev/null; then
+    kill "$WORKER_PID" 2>/dev/null || true
+  fi
   [[ -n "$GATEWAY_PID" ]] && wait "$GATEWAY_PID" 2>/dev/null || true
   [[ -n "$AGENT_PID" ]] && wait "$AGENT_PID" 2>/dev/null || true
+  [[ -n "$WORKER_PID" ]] && wait "$WORKER_PID" 2>/dev/null || true
   log 'Application services stopped. PostgreSQL remains available.'
 }
 
@@ -70,6 +75,24 @@ wait_for_url() {
   exit 1
 }
 
+wait_for_worker() {
+  for _attempt in {1..60}; do
+    local body
+    body="$(curl --fail --silent 'http://127.0.0.1:8100/readyz' 2>/dev/null || true)"
+    if [[ "$body" == *'"response_workers":{"ready":true'* ]]; then
+      log 'Durable agent worker is registered and ready.'
+      return
+    fi
+    if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+      log "worker exited during startup. See $RUN_DIR/worker.log"
+      exit 1
+    fi
+    sleep 1
+  done
+  log "worker did not register within 60 seconds. See $RUN_DIR/worker.log"
+  exit 1
+}
+
 for command in docker uv npm curl; do
   if ! command -v "$command" >/dev/null 2>&1; then
     log "Required command is unavailable: $command"
@@ -106,9 +129,14 @@ uv run --env-file "$ENV_FILE" voice-ai seed
 trap cleanup EXIT INT TERM
 
 log 'Starting agent service…'
-uv run --env-file "$ENV_FILE" voice-ai agent > >(tee "$RUN_DIR/agent.log") 2>&1 &
+AGENT_EMBEDDED_WORKER=false uv run --env-file "$ENV_FILE" voice-ai agent > >(tee "$RUN_DIR/agent.log") 2>&1 &
 AGENT_PID=$!
 wait_for_url 'agent' 'http://127.0.0.1:8100/readyz' "$AGENT_PID"
+
+log 'Starting durable agent worker…'
+uv run --env-file "$ENV_FILE" voice-ai worker > >(tee "$RUN_DIR/worker.log") 2>&1 &
+WORKER_PID=$!
+wait_for_worker
 
 log 'Starting voice gateway and UI…'
 uv run --env-file "$ENV_FILE" voice-ai serve > >(tee "$RUN_DIR/gateway.log") 2>&1 &
@@ -118,7 +146,7 @@ wait_for_url 'gateway' 'http://127.0.0.1:7860/readyz' "$GATEWAY_PID"
 log 'Voice AI is ready at http://localhost:7860'
 log 'Press Ctrl+C to stop the application services.'
 
-while kill -0 "$AGENT_PID" 2>/dev/null && kill -0 "$GATEWAY_PID" 2>/dev/null; do
+while kill -0 "$AGENT_PID" 2>/dev/null && kill -0 "$WORKER_PID" 2>/dev/null && kill -0 "$GATEWAY_PID" 2>/dev/null; do
   sleep 1
 done
 
