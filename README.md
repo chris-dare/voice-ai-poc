@@ -4,23 +4,26 @@ A local-first, general-purpose AI assistant with authenticated text chat, durabl
 interruptible real-time voice. The voice gateway and Pydantic AI agent are independently deployable.
 
 ```text
-Browser ── WebRTC ── voice gateway :7860 ── text/event stream ── agent :8100
+Browser ── WebRTC ── voice gateway :7860 ── text/event stream ── agent API :8100
 Browser ── Auth0 + JSON/SSE ── same-origin proxy ────────────────┘
+                                                               ├─ durable job queue ── agent workers
                                                                ├─ model resolver
-                                                               │  ├─ Anthropic (default)
-                                                               │  ├─ supported Pydantic providers
-                                                               │  └─ OpenAI-compatible gateway
+                                                               │  ├─ OpenRouter gateway (default)
+                                                               │  │  ├─ OpenAI GPT-5.6 Luna (default)
+                                                               │  │  └─ Anthropic Claude Sonnet
+                                                               │  ├─ Ollama local models
+                                                               │  └─ optional custom gateway
                                                                ├─ PostgreSQL
                                                                ├─ Monty CodeMode
                                                                ├─ deferred web/planning/specialists
                                                                └─ optional MCP servers
 ```
 
-Whisper transcription, Kokoro/Piper speech, and Monty code execution run locally. Model hosting is
-configuration-driven: Anthropic is the default in this checkout, Ollama remains available as a
-local provider, and an OpenAI-compatible gateway can be selected without changing orchestration
-code. Web access occurs only when the agent uses search/fetch; configured MCP servers may be
-external.
+Whisper transcription, Kokoro speech, and Monty code execution run locally. OpenRouter is the
+managed model gateway in this checkout, currently routing the default to OpenAI GPT-5.6 Luna while
+Anthropic Claude Sonnet remains selectable. Ollama remains available as a local route, and model
+selection changes through environment configuration rather than orchestration code. Web access
+occurs only when the agent uses search/fetch; configured MCP servers may be external.
 
 ## Capabilities
 
@@ -32,19 +35,23 @@ external.
   tasks, with shared budgets and nested activity streaming.
 - Optional external tools loaded from an MCP configuration file.
 - Durable conversations, responses, tool activity, and resumable SSE.
+- PostgreSQL-backed response dispatch with bounded admission, leases, heartbeats, retries, and
+  restart recovery; API and execution workers scale independently.
 - Auth0 access-token verification, subject ownership, scopes, idempotency, and rate limits.
 - Responsive ChatGPT-style interface with text, voice, history, deep links, and stop generation.
 - Logfire instrumentation for model calls, tool calls, HTTP, database work, system metrics, and
   application logs.
-- Durable per-response token usage, model-attempt latency, and estimated cost where pricing is
-  known.
+- Durable per-response token usage, model-attempt latency, OpenRouter-reported billed cost, and an
+  independent estimated-cost cross-check where pricing is known.
 - A versioned Pydantic Evals release gate with deterministic and explicitly opt-in live modes.
 
 The assistant is deep-capable but stays lean by default. Search, fetch, planning, and specialist
 delegation use Pydantic AI capability loading, so ordinary chat does not carry every specialist
 schema and instruction. CodeMode stays eager because it is a compact, broadly useful calculation
-surface. Dynamic model-authored multi-agent workflows and durable workflow engines remain
-deliberately postponed until evaluation data justifies their complexity.
+surface. Dynamic model-authored multi-agent workflows and checkpointed long-running workflow
+engines remain deliberately postponed until evaluation data justifies their complexity.
+Interactive responses already use durable, leased dispatch; they recover at the response boundary
+rather than claiming mid-model-call checkpoint recovery.
 
 ## Requirements
 
@@ -52,8 +59,7 @@ deliberately postponed until evaluation data justifies their complexity.
 - `uv`
 - Node.js 22+
 - Docker
-- An Anthropic API key, another supported provider credential, an OpenAI-compatible gateway, or
-  Ollama for local inference
+- An OpenRouter API key, or Ollama for local inference
 
 ## Setup
 
@@ -68,17 +74,21 @@ uv run voice-ai seed
 Choose the model host in `.env`:
 
 ```dotenv
-# Direct provider (default)
-AGENT_MODEL=anthropic:claude-sonnet-4-6
-ANTHROPIC_API_KEY=...
+# OpenRouter default and selectable catalogue
+AGENT_MODEL=openrouter:openai/gpt-5.6-luna
+AGENT_MODELS=openrouter:openai/gpt-5.6-luna,openrouter:anthropic/claude-sonnet-4.6,ollama:qwen3:1.7b
+OPENROUTER_API_KEY=...
+AGENT_THINKING_EFFORT=low
+AGENT_DEEP_THINKING_EFFORT=medium
+AGENT_PLANNING_ENABLED=false
 
 # Optional transient-failure fallback chain
 AGENT_FALLBACK_MODELS=["ollama:qwen3:1.7b"]
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 ```
 
-Any Pydantic AI `provider:model` string works when its provider extra and standard credentials are
-installed. For an OpenAI Chat Completions-compatible AI gateway:
+OpenRouter model IDs use `openrouter:<author>/<model>`. A separately operated OpenAI Chat
+Completions-compatible gateway can still be configured when required:
 
 ```dotenv
 AGENT_MODEL=openai-chat:gateway-model-name
@@ -89,6 +99,12 @@ AGENT_GATEWAY_API_KEY=...
 `AGENT_SUBAGENT_MODEL` optionally places specialists on a different host/model. If omitted, they
 use the primary selection and its fallback policy. Authentication failures do not trigger fallback;
 only transient API/connection failures and retryable HTTP statuses do.
+
+Ordinary turns default to low reasoning effort. A model-chosen delegation may use medium effort,
+but each specialist has independent request, tool-call, token, wall-time, and one-call-per-role
+budgets. This keeps deep work available without applying its latency and token cost to every prompt.
+Structured plan tracking is separately opt-in because it adds tool turns and is unnecessary for
+most interactive requests.
 
 `voice-ai seed` now applies migrations; it does not create a default subscriber or domain account.
 
@@ -178,12 +194,21 @@ optional `turn_id`, and `text`; it does not accept a subscriber ID.
 uv run ruff check .
 uv run pytest -q
 uv run voice-ai evals
+uv run voice-ai evals --modality voice
 npm --prefix frontend run check
 uv run voice-ai doctor --offline
 ```
 
-The contract eval makes no model or network calls. Run the same scenarios against the configured
-agent deliberately with `uv run --env-file .env voice-ai evals --live`. Current interactive SLOs
+Both contract evals make no model or network calls. The text suite covers direct answers, tool
+selection, calculations, current research, working-context recall, capability honesty,
+prompt-injection resistance, source integrity, and specialist delegation. The voice contract scores
+transcript accuracy, partial-transcript revision, barge-in cancellation, and latency budgets.
+
+Run the text scenarios against the configured agent deliberately with
+`uv run --env-file .env voice-ai evals --live`. Configure `AGENT_EVAL_JUDGE_MODEL` or pass
+`--judge-model provider:model` to add the case-specific answer-quality judges. Live voice evaluation
+is intentionally unavailable until consented recorded-audio fixtures and a hardware-profile runner
+are configured; the CLI will not mislabel synthetic contract data as a live voice result. Current interactive SLOs
 and metric definitions are published in [AGENT_SERVICE_SLOS.md](docs/AGENT_SERVICE_SLOS.md).
 When Logfire is enabled, every CLI eval is sent there as the normal workspace for inspecting case
 outputs, scores, traces, and experiment comparisons. Every run is also persisted as an immutable experiment in
@@ -203,8 +228,8 @@ semantics.
 - Pydantic AI is pinned to 2.14.1.
 - Pydantic AI Harness is kept on compatible 0.9.x releases.
 - Monty is pinned to the compatible sandbox release.
-- The Anthropic SDK is installed through Pydantic AI's provider extra; other provider extras can be
-  added without changing `AgentRuntime`.
+- Pydantic AI's native OpenRouter provider preserves model-specific profiles while OpenRouter owns
+  upstream provider routing and credentials.
 - The official package-bundled Pydantic AI skill is installed through Library Skills at
   `.agents/skills/building-pydantic-ai-agents`.
 
