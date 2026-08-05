@@ -31,6 +31,9 @@ def _download_if_missing(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(f"{destination.suffix}.part")
     try:
+        # `url` is never caller-supplied: the only call sites pass the pinned
+        # KOKORO_* constants above, so no 'file://' scheme can reach urlopen.
+        # nosemgrep
         with urlopen(url, timeout=300) as response, temporary.open("wb") as output:
             while chunk := response.read(1024 * 1024):
                 output.write(chunk)
@@ -45,6 +48,8 @@ def provision_punkt_tab(destination: Path) -> None:
     if installed.is_dir() and any(installed.iterdir()):
         return
 
+    # A pinned constant URL, and the payload is checksummed below before use.
+    # nosemgrep
     with urlopen(PUNKT_TAB_URL, timeout=60) as response:
         archive = response.read()
     if hashlib.sha256(archive).hexdigest() != PUNKT_TAB_SHA256:
