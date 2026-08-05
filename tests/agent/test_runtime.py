@@ -64,20 +64,18 @@ async def test_missing_model_credentials_fail_before_a_provider_request() -> Non
     runtime = AgentRuntime(
         Settings(
             _env_file=None,
-            agent_model="anthropic:claude-sonnet-4-6",
-            anthropic_api_key=None,
+            agent_model="openrouter:anthropic/claude-sonnet-4.6",
+            openrouter_api_key=None,
         )
     )
 
     events = [
         event
-        async for event in runtime.stream_turn(
-            AgentTurnRequest(session_id=uuid4(), text="Hello")
-        )
+        async for event in runtime.stream_turn(AgentTurnRequest(session_id=uuid4(), text="Hello"))
     ]
 
     assert [event.type for event in events] == ["response_started", "error"]
-    assert "ANTHROPIC_API_KEY is required" in events[-1].message
+    assert "OPENROUTER_API_KEY is required" in events[-1].message
     assert not events[-1].retryable
 
 
@@ -86,9 +84,7 @@ async def test_specialist_capabilities_are_progressively_disclosed() -> None:
     visible_tools: dict[str, bool] = {}
 
     async def model_stream(_messages, info: AgentInfo):
-        visible_tools.update(
-            {tool.name: tool.defer_loading for tool in info.function_tools}
-        )
+        visible_tools.update({tool.name: tool.defer_loading for tool in info.function_tools})
         yield "A direct answer needs no specialist."
 
     runtime = AgentRuntime(
@@ -104,17 +100,13 @@ async def test_specialist_capabilities_are_progressively_disclosed() -> None:
     assert not visible_tools["current_datetime"]
     assert not visible_tools["run_code"]
     assert visible_tools["delegate_task"]
-    assert visible_tools["write_plan"]
+    assert "write_plan" not in visible_tools
 
 
 @pytest.mark.asyncio
 async def test_code_mode_executes_in_monty_and_emits_tool_activity() -> None:
     async def model_stream(messages, _info: AgentInfo):
-        if any(
-            isinstance(part, ToolReturnPart)
-            for message in messages
-            for part in message.parts
-        ):
+        if any(isinstance(part, ToolReturnPart) for message in messages for part in message.parts):
             yield "The answer is 4."
         else:
             yield {
@@ -149,7 +141,7 @@ async def test_code_mode_executes_in_monty_and_emits_tool_activity() -> None:
 @pytest.mark.asyncio
 async def test_code_mode_cannot_read_provider_credentials(monkeypatch) -> None:
     secret = "must-not-enter-the-monty-sandbox"
-    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    monkeypatch.setenv("OPENROUTER_API_KEY", secret)
     sandbox_results: list[str] = []
 
     async def model_stream(messages, _info: AgentInfo):
@@ -157,8 +149,7 @@ async def test_code_mode_cannot_read_provider_credentials(monkeypatch) -> None:
             part
             for message in messages
             for part in message.parts
-            if isinstance(part, (ToolReturnPart, RetryPromptPart))
-            and part.tool_name == "run_code"
+            if isinstance(part, (ToolReturnPart, RetryPromptPart)) and part.tool_name == "run_code"
         ]
         if results:
             sandbox_results.extend(repr(part) for part in results)
@@ -167,10 +158,7 @@ async def test_code_mode_cannot_read_provider_credentials(monkeypatch) -> None:
             yield {
                 0: DeltaToolCall(
                     name="run_code",
-                    json_args=(
-                        '{"code":"import os\\nos.getenv('
-                        '\\"ANTHROPIC_API_KEY\\")"}'
-                    ),
+                    json_args=('{"code":"import os\\nos.getenv(\\"OPENROUTER_API_KEY\\")"}'),
                     tool_call_id="secret-probe",
                 )
             }
@@ -217,17 +205,12 @@ async def test_deep_agent_streams_nested_specialist_tool_activity() -> None:
         if any(part.tool_name == "delegate_task" for part in tool_returns):
             yield "The specialist verified that the answer is 4."
             return
-        delegate = next(
-            tool for tool in info.function_tools if tool.name == "delegate_task"
-        )
+        delegate = next(tool for tool in info.function_tools if tool.name == "delegate_task")
         if not delegate.defer_loading:
             yield {
                 0: DeltaToolCall(
                     name="delegate_task",
-                    json_args=(
-                        '{"agent_name":"analyst","task":'
-                        '"Use code to calculate 2 + 2."}'
-                    ),
+                    json_args=('{"agent_name":"analyst","task":"Use code to calculate 2 + 2."}'),
                     tool_call_id="delegate-1",
                 )
             }
@@ -255,16 +238,12 @@ async def test_deep_agent_streams_nested_specialist_tool_activity() -> None:
     nested_code = [
         event
         for event in events
-        if event.type in {"tool_started", "tool_completed"}
-        and event.tool == "run_code"
+        if event.type in {"tool_started", "tool_completed"} and event.tool == "run_code"
     ]
     assert [event.type for event in nested_code] == ["tool_started", "tool_completed"]
     assert all(event.source == "subagent" for event in nested_code)
     assert all(event.agent == "analyst" for event in nested_code)
-    assert any(
-        event.type == "tool_started" and event.tool == "delegate_task"
-        for event in events
-    )
+    assert any(event.type == "tool_started" and event.tool == "delegate_task" for event in events)
     assert events[-2].text == "The specialist verified that the answer is 4."
     assert events[-1].usage is not None
     assert {attempt.agent for attempt in events[-1].usage.attempts} == {
@@ -370,9 +349,7 @@ async def test_anthropic_thinking_and_tool_parts_survive_history_round_trip() ->
             ]
         ),
     ]
-    state = {
-        "messages": ModelMessagesTypeAdapter.dump_python(messages, mode="json")
-    }
+    state = {"messages": ModelMessagesTypeAdapter.dump_python(messages, mode="json")}
 
     await runtime.restore_session_state(session_id, state)
     restored = await runtime.export_session_state(session_id)

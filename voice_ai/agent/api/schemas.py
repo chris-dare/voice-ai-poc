@@ -29,6 +29,7 @@ class ConversationCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent_id: str = Field(min_length=1, max_length=120)
+    model: str | None = Field(default=None, min_length=1, max_length=255)
     metadata: Metadata = Field(default_factory=dict)
 
     @field_validator("metadata")
@@ -42,6 +43,7 @@ class ResponseCreateRequest(BaseModel):
 
     agent_id: str | None = Field(default=None, min_length=1, max_length=120)
     conversation_id: str | None = Field(default=None, min_length=1, max_length=80)
+    model: str = Field(min_length=1, max_length=255)
     input: str | list[InputItem]
     stream: bool = False
     background: bool = False
@@ -66,11 +68,7 @@ class ResponseCreateRequest(BaseModel):
     def input_text(self) -> str:
         if isinstance(self.input, str):
             return self.input.strip()
-        return "\n".join(
-            content.text
-            for item in self.input
-            for content in item.content
-        ).strip()
+        return "\n".join(content.text for item in self.input for content in item.content).strip()
 
 
 class RequiredActionDecision(BaseModel):

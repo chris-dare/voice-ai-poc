@@ -28,29 +28,37 @@ Voice gateway :7860                      │
   ├─ static responsive chat UI           │
   ├─ same-origin /agent-api proxy ───────┤
   ├─ Faster Whisper STT                  │
-  ├─ Kokoro/Piper TTS                    │
+  ├─ Kokoro TTS                          │
   └─ Pipecat turn-taking and barge-in    │
                                          ▼
-Agent service :8100
+Agent API :8100
   ├─ Auth0 JWT verification and ownership
   ├─ durable conversations/responses/events
+  ├─ shared database-backed rate limits
+  └─ bounded durable response queue ─────────┐
+                                             ▼
+Agent worker deployment
+  ├─ leased claims, heartbeats, retry/recovery
   ├─ Pydantic AI agent loop
   ├─ provider-neutral model resolver
-  │  ├─ Anthropic default
-  │  ├─ Pydantic-supported providers/fallbacks
-  │  └─ OpenAI-compatible AI gateway
+  │  ├─ OpenRouter managed gateway (default)
+  │  │  ├─ OpenAI GPT-5.6 Luna (default)
+  │  │  └─ Anthropic Claude Sonnet
+  │  ├─ Ollama local models
+  │  └─ optional custom AI gateway
   ├─ Pydantic AI Harness CodeMode
   ├─ Pydantic Monty sandbox
   ├─ deferred WebSearch, WebFetch, and Planning
   ├─ deferred researcher/analyst/reviewer sub-agents
   ├─ MCP toolsets (optional configuration)
-  ├─ PostgreSQL
+  ├─ PostgreSQL state and ordered event log
   └─ Logfire traces, metrics, and logs
 ```
 
 The voice gateway owns audio only. It never owns reasoning, tool implementations, model history,
-or PostgreSQL credentials. The agent service receives text, never microphone audio. Both services
-can run on one laptop, but their boundary allows independent deployment and scaling.
+or PostgreSQL credentials. The agent API accepts and streams work but does not own its execution;
+independent workers claim durable PostgreSQL jobs. Voice, API, and worker processes load separate
+configuration models and can be deployed and scaled independently.
 
 ## Agent design: deep-capable, not deep-by-default
 
@@ -67,10 +75,12 @@ event log show what each specialist is doing. Search, fetch, planning, and deleg
 their compact catalog is present initially and their schemas/instructions activate only when loaded.
 
 The model layer is separate from orchestration. `AGENT_MODEL` is a Pydantic AI `provider:model`
-identifier. Direct providers use their standard credentials; `openai-chat:*` can be pointed at an
-OpenAI-compatible gateway with base URL and API key settings. `AGENT_SUBAGENT_MODEL` is an optional
-role override. Explicit fallback models are tried only for transient model/API failures—not invalid
-credentials or ordinary model behavior. Ollama is one provider option rather than a runtime branch.
+identifier. OpenRouter is the managed model gateway and uses
+`openrouter:<author>/<model>` identifiers plus one gateway credential. `openai-chat:*` can still be
+pointed at a separately operated compatible gateway when required. `AGENT_SUBAGENT_MODEL` is an
+optional role override. Explicit fallback models are tried only for transient model/API
+failures—not invalid credentials or ordinary model behavior. Ollama is one provider option rather
+than a runtime branch.
 
 Every turn has hard limits: model requests, tool calls, total tokens, tool timeout, and agent
 retries. This keeps deeper reasoning bounded. Tool calls and nested CodeMode work are traced in
@@ -139,7 +149,7 @@ so its transcript survives reloads.
 
 ```text
 WebRTC input → Silero VAD/turn endpoint → Faster Whisper → remote agent adapter
-             → Kokoro/Piper TTS → WebRTC output
+             → Kokoro TTS → WebRTC output
 ```
 
 Speech models warm after the WebRTC worker starts. The microphone stays disabled until the server
@@ -150,15 +160,23 @@ control during generation.
 ## Operational requirements
 
 - Python 3.12 and `uv`; Node.js builds the browser bundle.
-- Anthropic Claude Sonnet is the current default, but model hosting changes through environment
-  configuration, not agent code. Ollama `qwen3:1.7b` remains a supported local selection.
+- OpenRouter is the current managed model gateway and routes the default to OpenAI GPT-5.6 Luna;
+  Anthropic Claude Sonnet remains selectable. Model and upstream provider selection change through
+  environment configuration, not agent code. Ollama `qwen3:1.7b` remains a supported local
+  selection.
 - PostgreSQL schema changes use Alembic.
+- Accepted responses and their execution jobs are committed in the same transaction. Workers use
+  leases, heartbeats, bounded concurrency, retry limits, and dead-letter terminal failures.
+- API rate-limit counters are shared in PostgreSQL, and SSE clients poll the durable event log at a
+  bounded interval so events remain visible across replicas even without process-local signals.
+- The production profile runs API and workers separately; the laptop profile may embed a worker.
 - Auth0 is mandatory when the public API/UI is enabled.
 - Logfire instrumentation covers FastAPI, Pydantic AI, HTTPX, SQLAlchemy/asyncpg, system metrics,
   application logs, and custom latency/auth signals.
 - `/livez` answers process liveness. `/readyz` validates model configuration, locally probes Ollama
   when selected, checks PostgreSQL/auth, and avoids a billable remote model call.
 - Public microphone use requires HTTPS and TURN outside localhost/LAN-safe environments.
+- Kokoro is the only supported TTS backend. A session never changes voices automatically.
 
 ## Acceptance criteria
 
@@ -167,7 +185,8 @@ control during generation.
 - A calculation causes a visible `run_code` lifecycle and runs inside Monty.
 - A current-information question can cause a visible web-search lifecycle.
 - A complex task can load deep work, delegate to a named specialist, and expose nested tool activity.
-- Switching direct providers or an OpenAI-compatible gateway requires configuration only.
+- Switching OpenRouter models or selecting the supported local/custom gateway routes requires
+  configuration only.
 - Configured MCP tools become available without changing the agent’s prompt/router code.
 - Tool promises without execution fail closed.
 - Long output never hides the composer or stop control.

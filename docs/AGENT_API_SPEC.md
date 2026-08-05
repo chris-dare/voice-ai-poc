@@ -183,6 +183,7 @@ retrieved, summarized, or compacted.
   "id": "conv_01J...",
   "object": "conversation",
   "agent_id": "agent_general_assistant",
+  "model": "provider:model-id",
   "status": "active",
   "created_at": "2026-07-30T14:20:00Z",
   "updated_at": "2026-07-30T14:25:31Z",
@@ -213,6 +214,7 @@ A response represents one agent execution.
   "id": "resp_01J...",
   "object": "response",
   "agent_id": "agent_general_assistant",
+  "model": "provider:model-id",
   "conversation_id": "conv_01J...",
   "status": "completed",
   "created_at": "2026-07-30T14:25:30Z",
@@ -250,20 +252,22 @@ A response represents one agent execution.
     "input_tokens": 84,
     "output_tokens": 12,
     "total_tokens": 96,
+    "reasoning_tokens": 18,
     "model_requests": 1,
     "tool_calls": 2,
     "wall_clock_ms": 1482.0,
     "model_duration_ms": 1210.4,
-    "route_model": "anthropic:claude-sonnet-4-6",
-    "route_provider": "anthropic",
-    "gateway": false,
+    "route_model": "openrouter:openai/gpt-5.6-luna",
+    "route_provider": "openrouter",
+    "gateway": true,
     "fallback_models": [],
-    "actual_models": ["claude-sonnet-4-6"],
+    "actual_models": ["openai/gpt-5.6-luna"],
+    "reported_cost_usd": "0.000401000000",
     "estimated_cost_usd": "0.000432000000",
     "cost_currency": "USD",
-    "cost_status": "estimated",
-    "cost_source": "genai-prices",
-    "cost_source_version": "0.0.73",
+    "cost_status": "reported",
+    "cost_source": "openrouter",
+    "cost_source_version": null,
     "latency": {
       "queue_delay_ms": 18.0,
       "time_to_first_text_ms": 1401.2,
@@ -288,9 +292,11 @@ Response statuses:
 Terminal statuses are `completed`, `failed`, and `cancelled`.
 
 `started_at`, `completed_at`, and `usage` MAY be `null` while work is active.
-Token values are provider-reported where available. Cost is an estimate, MAY be unavailable or
-partial, and MUST identify its currency and source when present. Clients MUST tolerate additional
-usage detail, including per-model-attempt and SLO fields, without treating it as billing authority.
+Token values are provider-reported where available. Cost MAY be provider-reported, estimated,
+partial, or unavailable and MUST identify its currency, status, and source when present. A
+per-attempt `provider_response_id` MAY be returned for support and billing reconciliation; clients
+MUST treat it as opaque. Clients MUST tolerate additional usage detail, including per-model-attempt
+and SLO fields, without treating the public response itself as billing authority.
 `error` MUST be non-null only for a failed response. `cancellation_reason` MUST be
 non-null only for a cancelled response; known values are `client_request`,
 `connection_lost`, `action_expired`, and `server_request`. Clients MUST tolerate
@@ -306,6 +312,43 @@ serializes conversation history and tool side effects.
 
 ## 4. Endpoints
 
+### 4.0 List available models
+
+```http
+GET /v1/models
+Authorization: Bearer <access-token>
+```
+
+Returns the deployment's configured model catalogue and the service's latest safe availability
+assessment. Clients MUST treat model IDs as opaque strings and MUST NOT maintain their own fixed
+list. A model with `selectable: false` MUST NOT be submitted for a new response.
+
+```json
+{
+  "object": "list",
+  "default": "provider:model-id",
+  "data": [
+    {
+      "id": "provider:model-id",
+      "object": "model",
+      "display_name": "Model Id",
+      "provider": "provider",
+      "status": "available",
+      "available": true,
+      "selectable": true,
+      "default": true,
+      "reason_code": null,
+      "detail": "Ready",
+      "checked_at": "2026-08-03T12:00:00Z"
+    }
+  ]
+}
+```
+
+Availability is advisory and can change between catalogue retrieval and invocation. The response
+creation endpoint remains authoritative and returns `model_not_allowed` or `model_unavailable`
+when the selected route cannot be accepted.
+
 ### 4.1 Create a conversation
 
 ```http
@@ -318,6 +361,7 @@ Idempotency-Key: <key>
 ```json
 {
   "agent_id": "agent_general_assistant",
+  "model": "provider:model-id",
   "metadata": {
     "channel": "voice"
   }
@@ -391,6 +435,7 @@ Idempotency-Key: <key>
 {
   "agent_id": "agent_general_assistant",
   "conversation_id": "conv_01J...",
+  "model": "provider:model-id",
   "input": [
     {
       "type": "message",
@@ -418,6 +463,7 @@ Fields:
 |---|---:|---|
 | `agent_id` | Conditional | Required without `conversation_id`; otherwise it MUST be omitted or match the conversation's agent |
 | `conversation_id` | No | Existing conversation; omitted for an isolated turn |
+| `model` | Yes | Opaque model ID obtained from `GET /v1/models`; selects this response's execution route |
 | `input` | Yes | Ordered input items |
 | `stream` | No | Return SSE when `true`; default `false` |
 | `background` | No | Return immediately and continue asynchronously; default `false` |
@@ -426,6 +472,13 @@ Fields:
 When `conversation_id` is present, the conversation's `agent_id` is authoritative.
 A conflicting request value MUST return `409 Conflict` with error code
 `agent_mismatch`.
+
+The response request's `model` is authoritative for that execution. The service MUST persist it on
+the response before queueing work, and every retry or background worker attempt MUST use the same
+snapshot. A conversation MAY remember the most recently selected model to restore client UI state,
+but that mutable preference MUST NOT replace the required per-response field. Consequently, one
+conversation may contain responses produced by different models with an accurate per-response
+audit trail.
 
 For a synchronous non-streaming request, return `200 OK` with the completed,
 failed, cancelled, or requires-action response object.
@@ -464,6 +517,7 @@ The API MAY accept a string as shorthand:
 {
   "agent_id": "agent_general_assistant",
   "conversation_id": "conv_01J...",
+  "model": "provider:model-id",
   "input": "What is the latest Pydantic AI release?"
 }
 ```
@@ -1014,6 +1068,7 @@ Idempotency-Key: c9ef6c5f-79ad-4bca-83ce-55f433ef34cd
 {
   "agent_id": "agent_general_assistant",
   "conversation_id": "conv_01J...",
+  "model": "provider:model-id",
   "input": "What is the latest Pydantic AI release?",
   "stream": true
 }

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -12,7 +11,7 @@ from faster_whisper.utils import download_model
 
 from voice_ai.agent.models import ModelReadiness, check_configured_model
 from voice_ai.agent.persistence.database import Database
-from voice_ai.shared.config import Settings
+from voice_ai.shared.config import VoiceSettings
 
 Status = Literal["pass", "warn", "fail"]
 
@@ -30,7 +29,7 @@ class CheckResult:
 
 
 async def run_checks(
-    settings: Settings,
+    settings: VoiceSettings,
     database: Database,
     *,
     include_frontend: bool = True,
@@ -53,7 +52,7 @@ async def run_checks(
 
 
 async def run_voice_checks(
-    settings: Settings,
+    settings: VoiceSettings,
     *,
     include_frontend: bool = True,
 ) -> list[CheckResult]:
@@ -80,7 +79,7 @@ def overall_status(checks: list[CheckResult]) -> str:
     return "ready"
 
 
-async def _agent_service_check(settings: Settings) -> CheckResult:
+async def _agent_service_check(settings: VoiceSettings) -> CheckResult:
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             response = await client.get(f"{settings.agent_base_url.rstrip('/')}/readyz")
@@ -118,7 +117,7 @@ def _model_check(status: ModelReadiness) -> CheckResult:
     )
 
 
-async def _database_check(settings: Settings, database: Database) -> CheckResult:
+async def _database_check(settings: VoiceSettings, database: Database) -> CheckResult:
     try:
         latency = await database.ping_ms()
         status: Status = "warn" if latency > 20 else "pass"
@@ -148,50 +147,20 @@ def _whisper_check(model: str) -> CheckResult:
         )
 
 
-def _tts_check(settings: Settings) -> CheckResult:
-    if settings.tts_provider == "kokoro":
-        model = settings.kokoro_download_dir / "kokoro-v1.0.onnx"
-        voices = settings.kokoro_download_dir / "voices-v1.0.bin"
-        if model.is_file() and voices.is_file():
-            return CheckResult("Kokoro", "pass", f"{settings.kokoro_voice} is cached")
-        fallback = _piper_check(settings)
-        if fallback.status != "fail":
-            return CheckResult(
-                "Kokoro",
-                "warn",
-                f"{settings.kokoro_voice} is missing; Piper fallback is available",
-                "uv run voice-ai doctor --fix --yes",
-            )
-        return CheckResult(
-            "Kokoro",
-            "fail",
-            f"{settings.kokoro_voice} is missing and no speech fallback is available",
-            "uv run voice-ai doctor --fix --yes",
-        )
-    return _piper_check(settings)
-
-
-def _piper_check(settings: Settings) -> CheckResult:
-    model = settings.piper_download_dir / f"{settings.piper_voice}.onnx"
-    config = settings.piper_download_dir / f"{settings.piper_voice}.onnx.json"
-    if model.is_file() and config.is_file():
-        return CheckResult("Piper", "pass", f"{settings.piper_voice} is cached")
-    if shutil.which("say"):
-        return CheckResult(
-            "Piper",
-            "warn",
-            f"{settings.piper_voice} is missing; macOS say fallback will be used",
-            "uv run voice-ai doctor --fix --yes",
-        )
+def _tts_check(settings: VoiceSettings) -> CheckResult:
+    model = settings.kokoro_download_dir / "kokoro-v1.0.onnx"
+    voices = settings.kokoro_download_dir / "voices-v1.0.bin"
+    if model.is_file() and voices.is_file():
+        return CheckResult("Kokoro", "pass", f"{settings.kokoro_voice} is cached")
     return CheckResult(
-        "Piper",
+        "Kokoro",
         "fail",
-        f"{settings.piper_voice} is missing and no supported fallback exists",
+        f"{settings.kokoro_voice} is missing",
         "uv run voice-ai doctor --fix --yes",
     )
 
 
-def _nltk_check(settings: Settings) -> CheckResult:
+def _nltk_check(settings: VoiceSettings) -> CheckResult:
     nltk_dir = settings.model_cache_dir / "nltk"
     try:
         nltk.data.find("tokenizers/punkt_tab", paths=[str(nltk_dir)])
@@ -205,7 +174,7 @@ def _nltk_check(settings: Settings) -> CheckResult:
         )
 
 
-def _deployment_check(settings: Settings) -> CheckResult:
+def _deployment_check(settings: VoiceSettings) -> CheckResult:
     errors = settings.public_profile_errors()
     if errors:
         return CheckResult(

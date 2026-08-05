@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from voice_ai.shared.config import Settings
+from voice_ai.shared.config import CommonSettings
 
 MessageSender = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -26,18 +26,22 @@ _browser_latency = None
 _model_request_latency = None
 _model_tokens = None
 _model_cost = None
+_model_reported_cost = None
 _response_queue_delay = None
 _response_first_text = None
 _response_completion = None
 _eval_runs = None
 _eval_assertion_pass_rate = None
+_agent_job_events = None
+_agent_queue_depth = None
 
 
-def configure_observability(settings: Settings, *, service_name: str) -> bool:
+def configure_observability(settings: CommonSettings, *, service_name: str) -> bool:
     """Configure one process before registering any framework instrumentation."""
     global _agent_turn_latency, _auth_events, _auth_iat_offset, _browser_latency
-    global _model_cost, _model_request_latency, _model_tokens
+    global _model_cost, _model_reported_cost, _model_request_latency, _model_tokens
     global _response_completion, _response_first_text, _response_queue_delay
+    global _agent_job_events, _agent_queue_depth
     global _eval_assertion_pass_rate, _eval_runs
     global _logfire_configured, _loguru_sink_id, _startup_latency, _voice_latency
 
@@ -57,7 +61,9 @@ def configure_observability(settings: Settings, *, service_name: str) -> bool:
                     "app.component": (
                         "evals"
                         if service_name.endswith("evals")
-                        else "agent"
+                        else "agent-worker"
+                        if service_name.endswith("worker")
+                        else "agent-api"
                         if service_name.endswith("agent")
                         else "gateway"
                     ),
@@ -72,7 +78,7 @@ def configure_observability(settings: Settings, *, service_name: str) -> bool:
                 capture_request_body=False,
                 capture_response_body=False,
             )
-            if service_name.endswith(("agent", "evals")):
+            if service_name.endswith(("agent", "worker", "evals")):
                 logfire.instrument_asyncpg(capture_parameters=False)
                 logfire.instrument_pydantic_ai(
                     include_content=settings.logfire_capture_content,
@@ -127,6 +133,11 @@ def configure_observability(settings: Settings, *, service_name: str) -> bool:
                 unit="USD",
                 description="Estimated model cost from the pinned genai-prices snapshot",
             )
+            _model_reported_cost = logfire.metric_counter(
+                "agent.model.cost.reported",
+                unit="USD",
+                description="Provider-reported billed model cost",
+            )
             _response_queue_delay = logfire.metric_histogram(
                 "agent.response.queue_delay",
                 unit="ms",
@@ -151,6 +162,16 @@ def configure_observability(settings: Settings, *, service_name: str) -> bool:
                 "agent.eval.assertion_pass_rate",
                 unit="1",
                 description="Fraction of evaluation assertions that passed",
+            )
+            _agent_job_events = logfire.metric_counter(
+                "agent.worker.job",
+                unit="1",
+                description="Durable response job lifecycle events",
+            )
+            _agent_queue_depth = logfire.metric_histogram(
+                "agent.worker.queue_depth",
+                unit="1",
+                description="Observed pending durable response jobs",
             )
             _logfire_configured = True
             logfire.info(
@@ -219,6 +240,15 @@ def record_model_attempt(attempt: Any) -> None:
             _model_tokens.add(attempt.output_tokens, {**attributes, "direction": "output"})
     if _model_cost is not None and attempt.estimated_cost_usd is not None:
         _model_cost.add(float(attempt.estimated_cost_usd), attributes)
+    if _model_reported_cost is not None and attempt.reported_cost_usd is not None:
+        _model_reported_cost.add(
+            float(attempt.reported_cost_usd),
+            {
+                **attributes,
+                "downstream_provider": attempt.downstream_provider or "unknown",
+                "is_byok": attempt.is_byok if attempt.is_byok is not None else False,
+            },
+        )
 
 
 def record_agent_response(
@@ -235,6 +265,19 @@ def record_agent_response(
         _response_first_text.record(time_to_first_text_ms, attributes)
     if _response_completion is not None:
         _response_completion.record(completion_ms, attributes)
+
+
+def record_agent_job_event(*, event: str, attempt: int) -> None:
+    if _agent_job_events is not None:
+        _agent_job_events.add(
+            1,
+            {"event": event, "attempt": attempt},
+        )
+
+
+def record_agent_queue_depth(depth: int) -> None:
+    if _agent_queue_depth is not None:
+        _agent_queue_depth.record(depth, {"workload": "interactive"})
 
 
 def record_eval_run(

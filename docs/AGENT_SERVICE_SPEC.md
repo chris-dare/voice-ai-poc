@@ -715,7 +715,7 @@ and total cost before each major implementation decision.
 | Persistence | PostgreSQL, SQLAlchemy async, asyncpg, Alembic | Keep conversations, responses, events, idempotency, approvals, and audit durable. |
 | Short work dispatch | Transactional outbox plus a bounded worker queue | Avoid dual-write gaps. A database-backed queue is sufficient before high scale. |
 | Durable workflows | Kitaru first; compare Temporal, Restate, DBOS, or Prefect | Introduce only for long-running or approval-heavy work. Prove crash recovery, replay, cancellation and idempotency in a focused spike before routing production work through it. |
-| Model gateway | Evaluate LiteLLM and AAIF agentgateway | Keep the direct-provider path. Select through conformance, latency, cost attribution, credential isolation and operational tests; do not duplicate retry ownership across service and gateway. |
+| Model gateway | OpenRouter initially; reassess LiteLLM or AAIF agentgateway if self-hosting becomes necessary | Use the native Pydantic AI OpenRouter provider, keep model IDs configuration-driven, and avoid duplicating retry ownership across the service and gateway. Validate latency, cost attribution, credential isolation and tool conformance continuously. |
 | Tool interoperability | MCP SDK or FastMCP-compatible client/server | Put independently deployed domain capabilities behind authenticated MCP boundaries. |
 | Code execution | Pydantic Monty for pure computation; isolated container or microVM for OS/file/browser work | An in-process language sandbox is not a substitute for OS isolation when host capabilities are required. |
 | Policy | Application policy layer first; Cedar or OPA when rules require independent lifecycle; OpenFGA for relationship authorization | Keep enforcement at the invocation boundary and policy versions in audit. |
@@ -764,7 +764,7 @@ remain stable:
 
 ## Appendix B. Current implementation snapshot (non-normative)
 
-As of 2026-08-02, the current project is closest to the Core profile:
+As of 2026-08-03, the current project implements the Core profile foundation:
 
 - implemented: separate agent-service boundary, authenticated tenant-owned resources, durable
   conversations/responses/events/idempotency/history, JSON and resumable SSE, cancellation,
@@ -772,10 +772,12 @@ As of 2026-08-02, the current project is closest to the Core profile:
   computation, web tools, optional MCP, bounded specialists, and distributed telemetry;
 - deployment choice: Auth0 currently provides OAuth 2.0/OIDC identity;
 - implemented foundation: per-response and per-model-attempt usage, estimated cost where pricing is
-  known, interactive latency objectives, and a versioned deterministic/live evaluation gate;
+  known, interactive latency objectives, a versioned deterministic/live evaluation gate,
+  PostgreSQL-backed bounded dispatch, leased worker ownership, heartbeats, retry exhaustion,
+  shared rate limits, and cross-replica durable event visibility;
 - partial: representative eval coverage and calibration, machine-readable capability manifest,
-  fully externalized cross-replica work coordination, comprehensive policy enforcement, and
-  deletion propagation evidence;
+  comprehensive policy enforcement, deletion propagation evidence, and checkpoint recovery inside
+  a model/tool turn;
 - not claimed: Effectful Tools, Durable Workflows, or Managed Platform conformance. Required-action
   API scaffolding alone is not Effectful Tools conformance, and persisted response state alone is
   not Durable Workflows conformance.

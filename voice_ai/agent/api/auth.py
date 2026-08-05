@@ -9,7 +9,7 @@ import jwt
 from jwt import PyJWKClient
 from jwt.exceptions import ImmatureSignatureError, InvalidIssuedAtError, PyJWTError
 
-from voice_ai.shared.config import Settings
+from voice_ai.shared.config import AgentSettings
 from voice_ai.shared.observability import record_auth_event, record_auth_iat_offset
 
 
@@ -36,7 +36,7 @@ class AccessTokenVerifier(Protocol):
 class Auth0AccessTokenVerifier:
     """Validate Auth0 RS256 access tokens against the tenant's cached JWKS."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: AgentSettings) -> None:
         issuer = settings.auth0_issuer
         audience = settings.auth0_audience
         jwks_url = settings.auth0_jwks_url
@@ -58,7 +58,9 @@ class Auth0AccessTokenVerifier:
             claims = await asyncio.to_thread(self._decode, token)
         except PyJWTError as exc:
             record_auth_event(outcome=type(exc).__name__, stage="verification")
-            raise AuthFailure(401, "invalid_token", "The access token is invalid or expired.") from exc
+            raise AuthFailure(
+                401, "invalid_token", "The access token is invalid or expired."
+            ) from exc
         except Exception as exc:
             raise AuthFailure(
                 503,
@@ -77,7 +79,9 @@ class Auth0AccessTokenVerifier:
             or self._settings.auth0_domain
         ).strip()
         if not tenant:
-            raise AuthFailure(403, "tenant_required", "No trusted tenant is associated with the token.")
+            raise AuthFailure(
+                403, "tenant_required", "No trusted tenant is associated with the token."
+            )
 
         scope_claim = claims.get("scope")
         scopes = set(str(scope_claim).split()) if scope_claim else set()

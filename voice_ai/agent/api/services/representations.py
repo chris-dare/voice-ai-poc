@@ -36,6 +36,7 @@ def conversation_repr(conversation: Conversation) -> dict[str, Any]:
         "id": conversation.id,
         "object": "conversation",
         "agent_id": conversation.agent_id,
+        "model": conversation.model_id,
         "status": conversation.status,
         "created_at": _timestamp(conversation.created_at),
         "updated_at": _timestamp(conversation.updated_at),
@@ -48,6 +49,7 @@ def response_repr(response: ResponseRecord) -> dict[str, Any]:
         "id": response.id,
         "object": "response",
         "agent_id": response.agent_id,
+        "model": response.model_id,
         "conversation_id": response.conversation_id,
         "status": response.status,
         "created_at": _timestamp(response.created_at),
@@ -74,7 +76,9 @@ def action_repr(action: RequiredAction) -> dict[str, Any]:
 
 
 def request_fingerprint(value: Any) -> str:
-    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -130,7 +134,13 @@ def _event_data(
 
 def _normalized_input(request: ResponseCreateRequest) -> list[dict[str, Any]]:
     if isinstance(request.input, str):
-        return [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": request.input.strip()}]}]
+        return [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": request.input.strip()}],
+            }
+        ]
     return [item.model_dump(mode="json") for item in request.input]
 
 
@@ -195,8 +205,16 @@ def _as_utc(value: datetime) -> datetime:
 
 def _status_title(status_code: int) -> str:
     return {
-        400: "Bad request", 401: "Unauthorized", 403: "Forbidden", 404: "Not found",
-        406: "Not acceptable", 409: "Conflict", 413: "Content too large",
-        415: "Unsupported media type", 422: "Invalid request", 429: "Too many requests",
-        500: "Internal server error", 503: "Service unavailable",
+        400: "Bad request",
+        401: "Unauthorized",
+        403: "Forbidden",
+        404: "Not found",
+        406: "Not acceptable",
+        409: "Conflict",
+        413: "Content too large",
+        415: "Unsupported media type",
+        422: "Invalid request",
+        429: "Too many requests",
+        500: "Internal server error",
+        503: "Service unavailable",
     }.get(status_code, "Request failed")

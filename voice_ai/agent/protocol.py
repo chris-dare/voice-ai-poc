@@ -11,6 +11,7 @@ from voice_ai.agent.usage import TurnUsage
 class AgentTurnRequest(BaseModel):
     session_id: UUID
     text: str = Field(min_length=1, max_length=4_000)
+    model_id: str | None = Field(default=None, min_length=1, max_length=255)
     turn_id: UUID = Field(default_factory=uuid4)
 
 
@@ -53,17 +54,15 @@ class ResponseCompleted(BaseModel):
 class AgentError(BaseModel):
     type: Literal["error"] = "error"
     message: str
+    code: str = "agent_execution_failed"
+    model_id: str | None = None
+    model_status: Literal["available", "degraded", "unavailable", "unknown"] | None = None
     retryable: bool = False
     usage: TurnUsage | None = None
 
 
 AgentEvent = Annotated[
-    ResponseStarted
-    | TextDelta
-    | ToolStarted
-    | ToolCompleted
-    | ResponseCompleted
-    | AgentError,
+    ResponseStarted | TextDelta | ToolStarted | ToolCompleted | ResponseCompleted | AgentError,
     Field(discriminator="type"),
 ]
 

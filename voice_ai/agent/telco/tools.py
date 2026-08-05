@@ -149,8 +149,7 @@ async def explain_latest_bill(
             (
                 charge
                 for charge in charges
-                if "renewal" in charge.description.lower()
-                and charge.amount == plan.monthly_price
+                if "renewal" in charge.description.lower() and charge.amount == plan.monthly_price
             ),
             None,
         )

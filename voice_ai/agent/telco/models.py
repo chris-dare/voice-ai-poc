@@ -31,9 +31,7 @@ class Subscriber(TableModel, table=True):
     account_type: str = Field(sa_type=String(16), nullable=False)
     balance: Decimal = Field(sa_type=Numeric(12, 2), nullable=False)
     currency: str = Field(default="GHS", sa_type=String(3), nullable=False)
-    plan_code: str = Field(
-        sa_type=String(32), foreign_key="plans.code", nullable=False
-    )
+    plan_code: str = Field(sa_type=String(32), foreign_key="plans.code", nullable=False)
     region: str = Field(sa_type=String(80), nullable=False)
     renewal_date: date = Field(sa_type=Date, nullable=False)
 
@@ -90,18 +88,12 @@ class PlanChangeRequest(TableModel, table=True):
         ondelete="CASCADE",
         nullable=False,
     )
-    from_plan_code: str = Field(
-        sa_type=String(32), foreign_key="plans.code", nullable=False
-    )
-    to_plan_code: str = Field(
-        sa_type=String(32), foreign_key="plans.code", nullable=False
-    )
+    from_plan_code: str = Field(sa_type=String(32), foreign_key="plans.code", nullable=False)
+    to_plan_code: str = Field(sa_type=String(32), foreign_key="plans.code", nullable=False)
     quoted_price: Decimal = Field(sa_type=Numeric(12, 2), nullable=False)
     status: str = Field(sa_type=String(24), nullable=False)
     requested_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
-    confirmation_nonce: str = Field(
-        sa_type=String(64), unique=True, nullable=False
-    )
+    confirmation_nonce: str = Field(sa_type=String(64), unique=True, nullable=False)
 
 
 def model_as_dict(model: TableModel, fields: tuple[str, ...]) -> dict[str, object]:

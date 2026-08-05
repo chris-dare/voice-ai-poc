@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from voice_ai.shared.config import Settings, get_settings
+from voice_ai.shared.config import VoiceSettings, get_voice_settings
 from voice_ai.shared.observability import (
     configure_observability,
     instrument_fastapi,
@@ -61,8 +61,8 @@ BROWSER_AUTH_EVENTS = {
 }
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    configured = settings or get_settings()
+def create_app(settings: VoiceSettings | None = None) -> FastAPI:
+    configured = settings or get_voice_settings()
     configure_observability(configured, service_name="voice-ai-gateway")
     capacity = SessionCapacity(configured.max_concurrent_sessions)
     session_tasks: set[asyncio.Task[Any]] = set()
@@ -166,10 +166,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/readyz", include_in_schema=False)
     async def readyz() -> JSONResponse:
-        ready = (
-            voice_status not in {"warming", "not_ready"}
-            and capacity.active < capacity.maximum
-        )
+        ready = voice_status not in {"warming", "not_ready"} and capacity.active < capacity.maximum
         return JSONResponse(
             {"status": "ready" if ready else "not_ready"},
             status_code=200 if ready else 503,
@@ -213,7 +210,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=503,
             )
         public_resource = upstream_path.split("/", 1)[0]
-        if public_resource not in {"conversations", "responses"}:
+        if public_resource not in {"conversations", "models", "responses"}:
             return JSONResponse({"detail": "Not found."}, status_code=404)
         forwarded_headers = {
             name: value
@@ -228,10 +225,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "x-request-id",
             }
         }
-        target = (
-            f"{configured.agent_base_url.rstrip('/')}/v1/"
-            f"{upstream_path.lstrip('/')}"
-        )
+        target = f"{configured.agent_base_url.rstrip('/')}/v1/{upstream_path.lstrip('/')}"
         upstream_request = agent_client.build_request(
             request.method,
             target,
@@ -269,6 +263,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
         content_type = upstream.headers.get("content-type", "")
         if content_type.startswith("text/event-stream"):
+
             async def body() -> AsyncIterator[bytes]:
                 try:
                     async for chunk in upstream.aiter_raw():
@@ -296,12 +291,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: dict[str, Any],
         authorization: Annotated[str | None, Header()] = None,
         x_conversation_id: Annotated[str | None, Header()] = None,
+        x_model_id: Annotated[str | None, Header()] = None,
     ) -> dict[str, str] | None:
         if voice_runtime is None or voice_status in {"warming", "not_ready"}:
             raise HTTPException(503, "Voice services are still warming up; inspect /healthz")
         voice_request = voice_runtime.parse_offer(request)
         public_access_token: str | None = None
         conversation_id: str | None = None
+        model_id: str | None = None
         if voice_request.pc_id is None:
             if browser_auth_enabled:
                 if not authorization or not authorization.startswith("Bearer "):
@@ -309,6 +306,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 conversation_id = (x_conversation_id or "").strip()
                 if not conversation_id:
                     raise HTTPException(422, "A conversation_id is required for voice")
+                model_id = (x_model_id or "").strip()
+                if not model_id:
+                    raise HTTPException(422, "A model selection is required for voice")
                 public_access_token = authorization.removeprefix("Bearer ").strip()
                 await _validate_voice_conversation(
                     client=agent_client,
@@ -330,6 +330,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     capacity=capacity,
                     public_access_token=public_access_token,
                     conversation_id=conversation_id,
+                    model_id=model_id,
                 )
             )
             session_tasks.add(task)
@@ -350,13 +351,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def ice_candidate(request: dict[str, Any]) -> dict[str, str]:
         if voice_runtime is None:
             raise HTTPException(503, "Voice services are still warming up")
-        await voice_runtime.request_handler.handle_patch_request(
-            voice_runtime.parse_patch(request)
-        )
+        await voice_runtime.request_handler.handle_patch_request(voice_runtime.parse_patch(request))
         return {"status": "success"}
 
     dist = _resolve_frontend(configured.frontend_dist)
     if dist.is_dir():
+
         @app.get("/conversations/{conversation_id}", include_in_schema=False)
         async def conversation_page(conversation_id: str) -> FileResponse:
             return FileResponse(
@@ -375,10 +375,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 async def _run_session_lazy(
     *,
     connection: Any,
-    settings: Settings,
+    settings: VoiceSettings,
     capacity: SessionCapacity,
     public_access_token: str | None = None,
     conversation_id: str | None = None,
+    model_id: str | None = None,
 ) -> None:
     module = await asyncio.to_thread(importlib.import_module, "voice_ai.voice.runtime")
     await module.run_session(
@@ -387,6 +388,7 @@ async def _run_session_lazy(
         capacity=capacity,
         public_access_token=public_access_token,
         conversation_id=conversation_id,
+        model_id=model_id,
     )
 
 

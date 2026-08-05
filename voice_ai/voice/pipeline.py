@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import platform
-import shutil
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
@@ -19,20 +16,17 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frameworks.rtvi import RTVIProcessor
 from pipecat.services.kokoro.tts import KokoroTTSService
-from pipecat.services.piper.tts import PiperTTSService
 from pipecat.services.tts_service import TTSService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
-from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
-from voice_ai.shared.config import Settings
+from voice_ai.shared.config import VoiceSettings
 from voice_ai.shared.observability import create_latency_observer
 from voice_ai.voice.agent_client import RemoteAgentLLMService
 from voice_ai.voice.speech.filters import SpeechSafetyFilter, TranscriptGuard
 from voice_ai.voice.speech.stt import LocalWhisperSTTService
-from voice_ai.voice.speech.tts import MacSayTTSService
 
 
 @dataclass(slots=True)
@@ -53,9 +47,10 @@ class VoiceSession:
 def create_voice_session(
     *,
     connection: SmallWebRTCConnection,
-    settings: Settings,
+    settings: VoiceSettings,
     public_access_token: str | None = None,
     conversation_id: str | None = None,
+    model_id: str | None = None,
 ) -> VoiceSession:
     """Build audio I/O only; reasoning and tools live behind the agent API."""
     transport = SmallWebRTCTransport(
@@ -84,15 +79,16 @@ def create_voice_session(
         on_event=lambda message: _send(rtvi, message),
         public_access_token=public_access_token,
         conversation_id=conversation_id,
+        model_id=model_id,
     )
     tts, degraded_tts = _create_tts(settings)
     context_aggregator = LLMContextAggregatorPair(
         LLMContext(),
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(),
-            user_turn_strategies=UserTurnStrategies(
-                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.5)]
-            ),
+            # The bundled on-device Smart Turn model considers the speech audio
+            # and cadence instead of treating every short pause as end-of-turn.
+            user_turn_strategies=UserTurnStrategies(),
         ),
     )
 
@@ -159,13 +155,6 @@ async def warm_tts_service(tts: TTSService) -> float:
             audio_samples += len(samples)
         if audio_samples == 0:
             raise RuntimeError("Kokoro warm-up produced no audio")
-    elif isinstance(tts, PiperTTSService):
-
-        def synthesize() -> int:
-            return sum(len(chunk.audio_int16_bytes) for chunk in tts._voice.synthesize("Ready."))
-
-        if await asyncio.to_thread(synthesize) == 0:
-            raise RuntimeError("Piper warm-up produced no audio")
     else:
         logger.debug("TTS warm-up is not available for {}", type(tts).__name__)
         return 0.0
@@ -175,35 +164,19 @@ async def warm_tts_service(tts: TTSService) -> float:
     return elapsed
 
 
-def _create_tts(settings: Settings) -> tuple[TTSService, bool]:
-    if settings.tts_provider == "kokoro":
-        kokoro_model = settings.kokoro_download_dir / "kokoro-v1.0.onnx"
-        kokoro_voices = settings.kokoro_download_dir / "voices-v1.0.bin"
-        if kokoro_model.is_file() and kokoro_voices.is_file():
-            return (
-                KokoroTTSService(
-                    model_path=str(kokoro_model),
-                    voices_path=str(kokoro_voices),
-                    settings=KokoroTTSService.Settings(voice=settings.kokoro_voice),
-                ),
-                False,
-            )
-        logger.warning("Kokoro is unavailable; falling back to Piper")
-
-    model_path = settings.piper_download_dir / f"{settings.piper_voice}.onnx"
-    config_path = settings.piper_download_dir / f"{settings.piper_voice}.onnx.json"
-    if model_path.exists() and config_path.exists():
-        return (
-            PiperTTSService(
-                download_dir=settings.piper_download_dir,
-                settings=PiperTTSService.Settings(voice=settings.piper_voice),
-            ),
-            False,
-        )
-    if platform.system() == "Darwin" and shutil.which("say"):
-        logger.warning("Piper is unavailable; using the degraded macOS say fallback")
-        return MacSayTTSService(), True
-    raise RuntimeError("Piper voice files are missing; run `voice-ai doctor --fix --yes`")
+def _create_tts(settings: VoiceSettings) -> tuple[TTSService, bool]:
+    kokoro_model = settings.kokoro_download_dir / "kokoro-v1.0.onnx"
+    kokoro_voices = settings.kokoro_download_dir / "voices-v1.0.bin"
+    if not kokoro_model.is_file() or not kokoro_voices.is_file():
+        raise RuntimeError("Kokoro voice files are missing; run `voice-ai doctor --fix --yes`")
+    return (
+        KokoroTTSService(
+            model_path=str(kokoro_model),
+            voices_path=str(kokoro_voices),
+            settings=KokoroTTSService.Settings(voice=settings.kokoro_voice),
+        ),
+        False,
+    )
 
 
 async def _send(rtvi: RTVIProcessor, message: dict[str, Any]) -> None:

@@ -6,14 +6,31 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite --host 0.0.0.0",
-    "check": "node --test && vite build"
+    "test": "node --test test/*.test.js && vitest run",
+    "typecheck": "tsc --noEmit",
+    "check": "npm test && tsc --noEmit && vite build"
   },
   "dependencies": {
     "@auth0/auth0-spa-js": "^2.24.1",
+    "@base-ui/react": "^1.6.0",
     "@pipecat-ai/client-js": "^1.6.0",
-    "@pipecat-ai/small-webrtc-transport": "^1.2.1"
+    "@pipecat-ai/small-webrtc-transport": "^1.2.1",
+    "lucide-react": "^1.28.0",
+    "motion": "^12.43.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
-    "vite": "^7.1.0"
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^5.2.0",
+    "jsdom": "^29.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^7.1.0",
+    "vitest": "^4.1.10"
   }
 }

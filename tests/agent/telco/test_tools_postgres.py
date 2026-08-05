@@ -44,9 +44,7 @@ async def test_real_queries_preserve_money_and_seed_is_idempotent(postgres: Data
     async with postgres.session() as session:
         count = (
             await session.exec(
-                select(func.count())
-                .select_from(Charge)
-                .where(Charge.subscriber_id == SUBSCRIBER)
+                select(func.count()).select_from(Charge).where(Charge.subscriber_id == SUBSCRIBER)
             )
         ).one()
 
@@ -77,9 +75,7 @@ async def test_confirmed_plan_change_writes_request_record(postgres: Database) -
     async with postgres.session() as session:
         row = (
             await session.exec(
-                select(PlanChangeRequest).where(
-                    PlanChangeRequest.id == UUID(result["request_id"])
-                )
+                select(PlanChangeRequest).where(PlanChangeRequest.id == UUID(result["request_id"]))
             )
         ).first()
 

@@ -18,7 +18,7 @@ from voice_ai.agent.api.services import AgentApiService, ApiProblem
 from voice_ai.agent.persistence.database import Database
 from voice_ai.agent.protocol import AgentTurnRequest
 from voice_ai.agent.runtime import AgentRuntime
-from voice_ai.shared.config import Settings, get_settings
+from voice_ai.shared.config import AgentSettings, get_agent_settings
 from voice_ai.shared.observability import (
     configure_observability,
     instrument_fastapi,
@@ -29,22 +29,23 @@ from voice_ai.shared.startup import PROCESS_STARTED_AT
 
 
 def create_agent_app(
-    settings: Settings | None = None,
+    settings: AgentSettings | None = None,
     *,
     token_verifier: AccessTokenVerifier | None = None,
 ) -> FastAPI:
-    configured = settings or get_settings()
+    configured = settings or get_agent_settings()
     configure_observability(configured, service_name="voice-ai-agent")
-    database = Database(configured.database_url)
+    database = Database(
+        configured.database_url,
+        pool_size=configured.database_pool_size,
+        max_overflow=configured.database_max_overflow,
+        pool_timeout=configured.database_pool_timeout_seconds,
+    )
     instrument_sqlalchemy(database.engine)
     runtime = AgentRuntime(configured)
     api_service = AgentApiService(configured, database, runtime)
     verifier = token_verifier
-    if (
-        verifier is None
-        and configured.api_enabled
-        and not configured.api_auth_errors()
-    ):
+    if verifier is None and configured.api_enabled and not configured.api_auth_errors():
         verifier = Auth0AccessTokenVerifier(configured)
 
     @asynccontextmanager
@@ -76,12 +77,9 @@ def create_agent_app(
     async def protocol_headers(request: Request, call_next):
         request_id = request.headers.get("X-Request-Id") or f"req_{uuid4().hex}"
         request.state.request_id = request_id
-        requires_json = (
-            request.method == "POST"
-            and (
-                request.url.path in {"/v1/conversations", "/v1/responses"}
-                or "/actions/" in request.url.path
-            )
+        requires_json = request.method == "POST" and (
+            request.url.path in {"/v1/conversations", "/v1/responses"}
+            or "/actions/" in request.url.path
         )
         content_type = request.headers.get("Content-Type", "").split(";", 1)[0].lower()
         if requires_json and content_type != "application/json":
@@ -121,7 +119,7 @@ def create_agent_app(
         headers = {}
         if exc.status_code == 401:
             headers["WWW-Authenticate"] = "Bearer"
-        if exc.status_code == 429 and exc.extensions.get("retry_after"):
+        if exc.extensions.get("retry_after"):
             headers["Retry-After"] = str(exc.extensions["retry_after"])
         return JSONResponse(
             body,
@@ -131,9 +129,7 @@ def create_agent_app(
         )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_problem(
-        request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
+    async def validation_problem(request: Request, exc: RequestValidationError) -> JSONResponse:
         request_id = getattr(request.state, "request_id", f"req_{uuid4().hex}")
         errors = [
             {
@@ -188,9 +184,7 @@ def create_agent_app(
     @app.exception_handler(Exception)
     async def unexpected_problem(request: Request, exc: Exception) -> JSONResponse:
         request_id = getattr(request.state, "request_id", f"req_{uuid4().hex}")
-        logger.opt(exception=exc).error(
-            "Unhandled agent API error request_id={}", request_id
-        )
+        logger.opt(exception=exc).error("Unhandled agent API error request_id={}", request_id)
         return JSONResponse(
             {
                 "type": "https://api.example.com/problems/internal-server-error",
@@ -209,6 +203,8 @@ def create_agent_app(
         authorization: Annotated[str | None, Header()] = None,
     ) -> None:
         secret = configured.agent_shared_secret
+        if configured.agent_deployment_profile == "public" and not secret:
+            raise HTTPException(503, "Internal agent authentication is not configured")
         if secret and not hmac.compare_digest(
             authorization or "",
             f"Bearer {secret}",
@@ -223,14 +219,22 @@ def create_agent_app(
     async def readyz() -> JSONResponse:
         model_status = await runtime.model_readiness()
         database_ready = False
+        worker_status = {
+            "ready": False,
+            "workers": 0,
+            "concurrency": 0,
+            "queued": 0,
+        }
         try:
             await database.ping_ms()
             database_ready = True
+            worker_status = await api_service.worker_readiness()
         except Exception:
             logger.debug("Agent database readiness check failed", exc_info=True)
         ready = bool(model_status["ready"]) and database_ready
         auth_ready = not configured.api_enabled or verifier is not None
-        ready = ready and auth_ready
+        production_errors = configured.production_errors()
+        ready = ready and auth_ready and not production_errors
         return JSONResponse(
             {
                 "status": "ready" if ready else "not_ready",
@@ -241,6 +245,8 @@ def create_agent_app(
                 "tools": True,
                 "database": database_ready,
                 "api_auth": auth_ready,
+                "response_workers": worker_status,
+                "configuration_errors": production_errors,
             },
             status_code=200 if ready else 503,
         )

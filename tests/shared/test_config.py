@@ -1,6 +1,33 @@
 import json
 
-from voice_ai.shared.config import Settings
+from voice_ai.shared.config import AgentSettings, Settings, VoiceSettings
+
+
+def test_deployed_services_only_load_their_owned_configuration() -> None:
+    assert "agent_model" in AgentSettings.model_fields
+    assert "database_url" in AgentSettings.model_fields
+    assert "openrouter_api_key" in AgentSettings.model_fields
+    assert "whisper_model" not in AgentSettings.model_fields
+    assert "kokoro_voice" not in AgentSettings.model_fields
+
+    assert "whisper_model" in VoiceSettings.model_fields
+    assert "kokoro_voice" in VoiceSettings.model_fields
+    assert "agent_model" not in VoiceSettings.model_fields
+    assert "database_url" not in VoiceSettings.model_fields
+
+
+def test_public_agent_profile_rejects_unsafe_process_configuration() -> None:
+    unsafe = AgentSettings(
+        _env_file=None,
+        agent_deployment_profile="public",
+        api_enabled=False,
+        agent_shared_secret="short",
+        agent_embedded_worker=True,
+    )
+    errors = unsafe.production_errors()
+    assert any("API_ENABLED" in error for error in errors)
+    assert any("32 characters" in error for error in errors)
+    assert any("AGENT_EMBEDDED_WORKER" in error for error in errors)
 
 
 def test_public_profile_requires_https_and_turn() -> None:
@@ -51,9 +78,7 @@ def test_agent_api_requires_auth0_configuration_only_when_enabled() -> None:
     )
     assert configured.api_auth_errors() == []
     assert configured.auth0_issuer == "https://tenant.example.auth0.com/"
-    assert configured.auth0_jwks_url == (
-        "https://tenant.example.auth0.com/.well-known/jwks.json"
-    )
+    assert configured.auth0_jwks_url == ("https://tenant.example.auth0.com/.well-known/jwks.json")
 
 
 def test_logfire_content_capture_is_private_by_default() -> None:
@@ -74,7 +99,31 @@ def test_agent_model_fallbacks_accept_json_or_comma_separated_env_shapes() -> No
         _env_file=None,
         agent_fallback_models='["openai:gpt-5", "ollama:qwen3:1.7b"]',
     ).agent_fallback_models == ["openai:gpt-5", "ollama:qwen3:1.7b"]
+
+
+def test_selectable_models_are_configuration_only_and_deduplicated() -> None:
+    settings = AgentSettings(
+        _env_file=None,
+        agent_model="provider:default",
+        agent_models="provider:alternate, provider:default",
+    )
+
+    assert settings.selectable_model_ids == (
+        "provider:default",
+        "provider:alternate",
+    )
     assert Settings(
         _env_file=None,
         agent_fallback_models="openai:gpt-5, ollama:qwen3:1.7b",
     ).agent_fallback_models == ["openai:gpt-5", "ollama:qwen3:1.7b"]
+
+
+def test_model_catalog_accepts_dotenv_dequoted_array(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "AGENT_MODELS",
+        "[provider:first,provider:second]",
+    )
+
+    settings = AgentSettings(_env_file=None, agent_model="provider:default")
+
+    assert settings.agent_models == ["provider:first", "provider:second"]

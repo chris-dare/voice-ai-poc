@@ -1,23 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import socket
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from time import perf_counter
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from loguru import logger
-from sqlalchemy import and_, delete, func, or_
+from pydantic_ai.models import parse_model_id
+from sqlalchemy import and_, delete, func, or_, text
 from sqlmodel import select
 
 from voice_ai.agent.api.auth import AuthContext
 from voice_ai.agent.api.models import (
     Conversation,
     IdempotencyRecord,
+    ModelAvailability,
+    RateLimitBucket,
     RequiredAction,
     ResponseEvent,
+    ResponseJob,
     ResponseRecord,
+    WorkerNode,
 )
 from voice_ai.agent.api.schemas import ConversationCreateRequest, ResponseCreateRequest
 from voice_ai.agent.api.services.events import EventBroker
@@ -40,6 +47,7 @@ from voice_ai.agent.api.services.representations import (
     response_repr,
     sse_record,
 )
+from voice_ai.agent.models import model_display_name, probe_model_availability
 from voice_ai.agent.persistence.database import Database
 from voice_ai.agent.protocol import (
     AgentError,
@@ -51,8 +59,12 @@ from voice_ai.agent.protocol import (
     ToolStarted,
 )
 from voice_ai.agent.runtime import AgentRuntime
-from voice_ai.shared.config import Settings
-from voice_ai.shared.observability import record_agent_response
+from voice_ai.shared.config import AgentSettings
+from voice_ai.shared.observability import (
+    record_agent_job_event,
+    record_agent_queue_depth,
+    record_agent_response,
+)
 
 ACTIVE_STATUSES = frozenset({"queued", "in_progress", "requires_action"})
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -61,7 +73,7 @@ TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 class AgentApiService:
     def __init__(
         self,
-        settings: Settings,
+        settings: AgentSettings,
         database: Database,
         runtime: AgentRuntime,
     ) -> None:
@@ -72,18 +84,18 @@ class AgentApiService:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._expiry_tasks: dict[str, asyncio.Task[None]] = {}
         self._response_locks: dict[str, asyncio.Lock] = {}
-        self._task_guard = asyncio.Lock()
         self._maintenance_task: asyncio.Task[None] | None = None
+        self._worker_task: asyncio.Task[None] | None = None
+        self._work_available = asyncio.Event()
+        self._worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
 
-    async def startup(self) -> None:
-        await self._reconcile_interrupted_responses()
+    async def startup(self, *, start_worker: bool | None = None) -> None:
+        await self._reconcile_response_jobs()
         async with self.database.session() as session:
             actions = list(
                 (
                     await session.exec(
-                        select(RequiredAction).where(
-                            RequiredAction.decision.is_(None)
-                        )
+                        select(RequiredAction).where(RequiredAction.decision.is_(None))
                     )
                 ).all()
             )
@@ -93,8 +105,17 @@ class AgentApiService:
             self._maintenance_loop(),
             name="agent-api-maintenance",
         )
+        if start_worker if start_worker is not None else self.settings.agent_embedded_worker:
+            self._worker_task = asyncio.create_task(
+                self.run_worker_forever(),
+                name="agent-response-worker",
+            )
 
     async def shutdown(self) -> None:
+        if self._worker_task:
+            self._worker_task.cancel()
+            await asyncio.gather(self._worker_task, return_exceptions=True)
+            self._worker_task = None
         tasks = [*self._tasks.values(), *self._expiry_tasks.values()]
         if self._maintenance_task:
             tasks.append(self._maintenance_task)
@@ -102,6 +123,137 @@ class AgentApiService:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._expiry_tasks.clear()
+        self._maintenance_task = None
+
+    async def list_models(self) -> dict[str, Any]:
+        data = []
+        for model_id in self.settings.selectable_model_ids:
+            data.append(await self._model_entry(model_id, refresh=True))
+        return {
+            "object": "list",
+            "data": data,
+            "default": self.settings.agent_model or None,
+        }
+
+    async def _model_entry(
+        self,
+        model_id: str,
+        *,
+        refresh: bool,
+    ) -> dict[str, Any]:
+        now = _now()
+        async with self.database.session() as session:
+            health = await session.get(ModelAvailability, model_id)
+        fresh = bool(
+            health
+            and now - _as_utc(health.checked_at)
+            < timedelta(seconds=self.settings.agent_model_probe_ttl_seconds)
+        )
+        if refresh and not fresh:
+            probe = await probe_model_availability(self.settings, model_id)
+            await self._record_model_availability(
+                model_id,
+                status=probe.status,
+                reason_code=probe.reason_code,
+                detail=probe.detail,
+            )
+            async with self.database.session() as session:
+                health = await session.get(ModelAvailability, model_id)
+
+        provider, _name = parse_model_id(model_id)
+        status = health.status if health is not None else "unknown"
+        return {
+            "id": model_id,
+            "object": "model",
+            "display_name": model_display_name(model_id),
+            "provider": provider or "unknown",
+            "status": status,
+            "available": status == "available",
+            "selectable": status != "unavailable",
+            "default": model_id == self.settings.agent_model,
+            "reason_code": health.reason_code if health is not None else None,
+            "detail": (
+                health.detail
+                if health is not None
+                else "Configured; availability has not been checked"
+            ),
+            "checked_at": (health.checked_at.isoformat() if health is not None else None),
+        }
+
+    async def _ensure_model_selectable(self, model_id: str) -> None:
+        if not model_id or model_id not in self.settings.selectable_model_ids:
+            raise ApiProblem(
+                422,
+                "model_not_allowed",
+                "The requested model is not in the configured model catalog.",
+                extensions={"model": model_id},
+            )
+        # Catalog reads perform active probes. Submission uses the shared cached
+        # result so provider I/O never holds a response-creation transaction open.
+        entry = await self._model_entry(model_id, refresh=False)
+        if not entry["selectable"]:
+            raise ApiProblem(
+                503,
+                "model_unavailable",
+                f"{entry['display_name']} is currently unavailable. Choose another model.",
+                extensions={
+                    "model": model_id,
+                    "model_status": entry["status"],
+                    "reason_code": entry["reason_code"],
+                    "retry_after": self.settings.agent_model_probe_ttl_seconds,
+                },
+            )
+
+    async def _record_model_availability(
+        self,
+        model_id: str,
+        *,
+        status: str,
+        reason_code: str | None,
+        detail: str | None,
+    ) -> None:
+        now = _now()
+        values = {
+            "model_id": model_id,
+            "status": status,
+            "reason_code": reason_code,
+            "detail": detail,
+            "checked_at": now,
+            "last_success_at": now if status == "available" else None,
+            "last_failure_at": now if status in {"degraded", "unavailable"} else None,
+        }
+        dialect = self.database.engine.dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert
+        else:  # pragma: no cover - supported deployments use PostgreSQL/SQLite
+            raise RuntimeError(f"Unsupported availability database dialect: {dialect}")
+        statement = insert(ModelAvailability).values(**values)
+        excluded = statement.excluded
+        statement = statement.on_conflict_do_update(
+            index_elements=[ModelAvailability.model_id],
+            set_={
+                "status": excluded.status,
+                "reason_code": excluded.reason_code,
+                "detail": excluded.detail,
+                "checked_at": excluded.checked_at,
+                "last_success_at": (
+                    excluded.last_success_at
+                    if status == "available"
+                    else ModelAvailability.last_success_at
+                ),
+                "last_failure_at": (
+                    excluded.last_failure_at
+                    if status in {"degraded", "unavailable"}
+                    else ModelAvailability.last_failure_at
+                ),
+            },
+        )
+        async with self.database.session_factory.begin() as session:
+            await session.exec(statement)
 
     async def create_conversation(
         self,
@@ -110,6 +262,8 @@ class AgentApiService:
         idempotency_key: str | None,
     ) -> tuple[dict[str, Any], bool]:
         self._validate_agent(request.agent_id)
+        model_id = request.model or self.settings.agent_model
+        await self._ensure_model_selectable(model_id)
         fingerprint = request_fingerprint(request.model_dump(mode="json"))
         route = "/v1/conversations"
         async with self.database.session_factory.begin() as session:
@@ -130,6 +284,7 @@ class AgentApiService:
                 subject_id=auth.subject_id,
                 subscriber_id=None,
                 agent_id=request.agent_id,
+                model_id=model_id,
                 status="active",
                 metadata_json=request.metadata,
                 session_state={},
@@ -200,9 +355,7 @@ class AgentApiService:
             ),
         }
 
-    async def get_conversation(
-        self, auth: AuthContext, conversation_id: str
-    ) -> dict[str, Any]:
+    async def get_conversation(self, auth: AuthContext, conversation_id: str) -> dict[str, Any]:
         async with self.database.session() as session:
             conversation = await session.get(Conversation, conversation_id)
             if (
@@ -258,9 +411,7 @@ class AgentApiService:
                 conversation_id,
             )
             await session.exec(
-                delete(ResponseRecord).where(
-                    ResponseRecord.conversation_id == conversation_id
-                )
+                delete(ResponseRecord).where(ResponseRecord.conversation_id == conversation_id)
             )
             conversation.status = "deleted"
             conversation.metadata_json = {}
@@ -332,6 +483,31 @@ class AgentApiService:
                 runtime_session_id = uuid4()
             self._validate_agent(agent_id)
 
+            # The response request is authoritative. Conversation.model_id is a
+            # mutable UI preference, while ResponseRecord.model_id is the immutable
+            # execution snapshot used by workers and retries.
+            model_id = request.model
+            await self._ensure_model_selectable(model_id)
+
+            if self.database.engine.dialect.name == "postgresql":
+                await session.exec(
+                    text("SELECT pg_advisory_xact_lock(hashtext('agent_queue_capacity'))")
+                )
+            queued_jobs = (
+                await session.exec(
+                    select(func.count(ResponseJob.response_id)).where(
+                        ResponseJob.status.in_({"pending", "running"})
+                    )
+                )
+            ).one()
+            if queued_jobs >= self.settings.agent_queue_capacity:
+                raise ApiProblem(
+                    503,
+                    "capacity_exhausted",
+                    "The agent is at capacity; retry shortly.",
+                    extensions={"retry_after": 2},
+                )
+
             now = _now()
             response = ResponseRecord(
                 id=_id("resp"),
@@ -341,6 +517,7 @@ class AgentApiService:
                 subject_id=auth.subject_id,
                 subscriber_id=None,
                 agent_id=agent_id,
+                model_id=model_id,
                 status="queued",
                 created_at=now,
                 started_at=None,
@@ -370,6 +547,21 @@ class AgentApiService:
                     ),
                 )
             )
+            session.add(
+                ResponseJob(
+                    response_id=response.id,
+                    status="pending",
+                    decision=None,
+                    attempt_count=0,
+                    max_attempts=self.settings.agent_job_max_attempts,
+                    available_at=now,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    heartbeat_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
             await self._idempotency_store(
                 session,
                 auth,
@@ -381,12 +573,14 @@ class AgentApiService:
                 response.id,
             )
             if conversation:
+                conversation.model_id = model_id
                 metadata = dict(conversation.metadata_json)
                 if not metadata.get("title"):
                     metadata["title"] = _conversation_title(request.input_text())
                     conversation.metadata_json = metadata
                 conversation.updated_at = now
         await self.events.publish(response.id)
+        self._work_available.set()
         return response_repr(response), False
 
     async def get_response(self, auth: AuthContext, response_id: str) -> dict[str, Any]:
@@ -457,26 +651,61 @@ class AgentApiService:
         }
 
     async def start_response(self, response_id: str, *, decision: str | None = None) -> None:
-        async with self._task_guard:
-            existing = self._tasks.get(response_id)
-            if existing and not existing.done():
-                return
-            task = asyncio.create_task(
-                self._run_response(response_id, decision=decision),
-                name=f"public-response-{response_id}",
-            )
-            self._tasks[response_id] = task
-            task.add_done_callback(lambda _: self._tasks.pop(response_id, None))
-
-    async def wait_for_terminal(self, response_id: str) -> dict[str, Any]:
-        task = self._tasks.get(response_id)
-        if task:
-            await task
-        async with self.database.session() as session:
-            response = await session.get(ResponseRecord, response_id)
+        async with self.database.session_factory.begin() as session:
+            response = await session.get(ResponseRecord, response_id, with_for_update=True)
             if response is None:
                 raise ApiProblem(404, "not_found", "Response not found.")
-            return response_repr(response)
+            if response.status not in {"queued", "in_progress"}:
+                return
+            job = await session.get(ResponseJob, response_id, with_for_update=True)
+            now = _now()
+            if job is None:
+                job = ResponseJob(
+                    response_id=response_id,
+                    status="pending",
+                    decision=decision,
+                    attempt_count=0,
+                    max_attempts=self.settings.agent_job_max_attempts,
+                    available_at=now,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    heartbeat_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(job)
+            elif job.status not in {"running", "pending"}:
+                job.status = "pending"
+                job.available_at = now
+                job.lease_owner = None
+                job.lease_expires_at = None
+            if decision is not None:
+                job.decision = decision
+            job.updated_at = now
+        self._work_available.set()
+
+    async def wait_for_terminal(self, response_id: str) -> dict[str, Any]:
+        deadline = perf_counter() + self.settings.api_sync_wait_timeout_seconds
+        while True:
+            async with self.database.session() as session:
+                response = await session.get(ResponseRecord, response_id)
+                if response is None:
+                    raise ApiProblem(404, "not_found", "Response not found.")
+                if response.status in TERMINAL_STATUSES or response.status == "requires_action":
+                    return response_repr(response)
+            if perf_counter() >= deadline:
+                raise ApiProblem(
+                    504,
+                    "response_timeout",
+                    "The response is still running; retrieve it using its response ID.",
+                    extensions={"response_id": response_id, "retry_after": 1},
+                )
+            observed = await self.events.version(response_id)
+            await self.events.wait(
+                response_id,
+                observed,
+                self.settings.api_event_poll_seconds,
+            )
 
     async def cancel_response(
         self,
@@ -499,6 +728,12 @@ class AgentApiService:
                 return response_repr(response), True
             if response.status in ACTIVE_STATUSES:
                 await self._set_cancelled(session, response, reason)
+            job = await session.get(ResponseJob, response_id, with_for_update=True)
+            if job is not None:
+                job.status = "cancelled"
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.updated_at = _now()
             await self._idempotency_store(
                 session,
                 auth,
@@ -513,6 +748,7 @@ class AgentApiService:
         if task and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        self._tasks.pop(response_id, None)
         await self._restore_session_for_response(response)
         await self.runtime.clear_confirmation(response.runtime_session_id)
         state = await self.runtime.export_session_state(response.runtime_session_id)
@@ -572,6 +808,30 @@ class AgentApiService:
                 action.decided_at = now
                 response.status = "queued"
                 response.required_action_json = None
+                job = await session.get(ResponseJob, response_id, with_for_update=True)
+                if job is None:
+                    job = ResponseJob(
+                        response_id=response_id,
+                        status="pending",
+                        decision=decision,
+                        attempt_count=0,
+                        max_attempts=self.settings.agent_job_max_attempts,
+                        available_at=now,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        heartbeat_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(job)
+                else:
+                    job.status = "pending"
+                    job.decision = decision
+                    job.attempt_count = 0
+                    job.available_at = now
+                    job.lease_owner = None
+                    job.lease_expires_at = None
+                    job.updated_at = now
                 await self._idempotency_store(
                     session,
                     auth,
@@ -648,6 +908,7 @@ class AgentApiService:
         heartbeat_seconds: float = 15,
     ) -> AsyncIterator[str]:
         cursor = after
+        last_heartbeat = perf_counter()
         while True:
             observed = await self.events.version(response_id)
             events, status = await self.event_page(auth, response_id, cursor)
@@ -656,8 +917,18 @@ class AgentApiService:
                 yield sse_record(event)
             if status in TERMINAL_STATUSES or status == "requires_action":
                 return
-            if not await self.events.wait(response_id, observed, heartbeat_seconds):
+            until_heartbeat = max(
+                0.05,
+                heartbeat_seconds - (perf_counter() - last_heartbeat),
+            )
+            notified = await self.events.wait(
+                response_id,
+                observed,
+                min(self.settings.api_event_poll_seconds, until_heartbeat),
+            )
+            if not notified and perf_counter() - last_heartbeat >= heartbeat_seconds:
                 yield ": ping\n\n"
+                last_heartbeat = perf_counter()
 
     async def prune(self) -> None:
         now = _now()
@@ -669,13 +940,14 @@ class AgentApiService:
                 ResponseRecord.completed_at < event_cutoff,
             )
             await session.exec(
-                delete(ResponseEvent).where(
-                    ResponseEvent.response_id.in_(expired_response_ids)
-                )
+                delete(ResponseEvent).where(ResponseEvent.response_id.in_(expired_response_ids))
             )
+            await session.exec(delete(IdempotencyRecord).where(IdempotencyRecord.expires_at < now))
+            await session.exec(delete(RateLimitBucket).where(RateLimitBucket.expires_at < now))
             await session.exec(
-                delete(IdempotencyRecord).where(
-                    IdempotencyRecord.expires_at < now
+                delete(WorkerNode).where(
+                    WorkerNode.heartbeat_at
+                    < now - timedelta(seconds=self.settings.agent_worker_presence_ttl_seconds * 10)
                 )
             )
 
@@ -684,20 +956,277 @@ class AgentApiService:
             await asyncio.sleep(3_600)
             await self.prune()
 
+    async def run_worker_forever(self) -> None:
+        """Claim durable jobs up to the configured per-process concurrency."""
+        logger.info(
+            "Agent response worker started worker_id={} concurrency={}",
+            self._worker_id,
+            self.settings.agent_worker_concurrency,
+        )
+        presence = asyncio.create_task(
+            self._worker_presence_loop(),
+            name="agent-worker-presence",
+        )
+        try:
+            while True:
+                self._tasks = {
+                    response_id: task
+                    for response_id, task in self._tasks.items()
+                    if not task.done()
+                }
+                claimed_any = False
+                while len(self._tasks) < self.settings.agent_worker_concurrency:
+                    claimed = await self._claim_response_job()
+                    if claimed is None:
+                        break
+                    response_id, decision = claimed
+                    claimed_any = True
+                    task = asyncio.create_task(
+                        self._execute_claimed_job(response_id, decision),
+                        name=f"agent-response-{response_id}",
+                    )
+                    self._tasks[response_id] = task
+                if claimed_any:
+                    await asyncio.sleep(0)
+                    continue
+                self._work_available.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._work_available.wait(),
+                        timeout=self.settings.agent_job_poll_seconds,
+                    )
+                except TimeoutError:
+                    await self._fail_exhausted_jobs()
+        finally:
+            presence.cancel()
+            await asyncio.gather(presence, return_exceptions=True)
+            await self._record_worker_presence("stopped")
+
+    async def _worker_presence_loop(self) -> None:
+        while True:
+            await self._record_worker_presence("active")
+            await asyncio.sleep(max(2, self.settings.agent_worker_presence_ttl_seconds // 3))
+
+    async def _record_worker_presence(self, status: str) -> None:
+        now = _now()
+        async with self.database.session_factory.begin() as session:
+            node = await session.get(WorkerNode, self._worker_id, with_for_update=True)
+            if node is None:
+                session.add(
+                    WorkerNode(
+                        id=self._worker_id,
+                        status=status,
+                        concurrency=self.settings.agent_worker_concurrency,
+                        started_at=now,
+                        heartbeat_at=now,
+                    )
+                )
+            else:
+                node.status = status
+                node.concurrency = self.settings.agent_worker_concurrency
+                node.heartbeat_at = now
+
+    async def worker_readiness(self) -> dict[str, Any]:
+        cutoff = _now() - timedelta(seconds=self.settings.agent_worker_presence_ttl_seconds)
+        async with self.database.session() as session:
+            active = (
+                await session.exec(
+                    select(func.count(WorkerNode.id), func.sum(WorkerNode.concurrency)).where(
+                        WorkerNode.status == "active",
+                        WorkerNode.heartbeat_at >= cutoff,
+                    )
+                )
+            ).one()
+            queued = (
+                await session.exec(
+                    select(func.count(ResponseJob.response_id)).where(
+                        ResponseJob.status == "pending"
+                    )
+                )
+            ).one()
+        workers, concurrency = active
+        record_agent_queue_depth(int(queued or 0))
+        return {
+            "ready": bool(workers),
+            "workers": int(workers or 0),
+            "concurrency": int(concurrency or 0),
+            "queued": int(queued or 0),
+        }
+
+    async def _claim_response_job(self) -> tuple[str, str | None] | None:
+        now = _now()
+        async with self.database.session_factory.begin() as session:
+            statement = (
+                select(ResponseJob)
+                .where(
+                    ResponseJob.available_at <= now,
+                    ResponseJob.attempt_count < ResponseJob.max_attempts,
+                    or_(
+                        ResponseJob.status == "pending",
+                        and_(
+                            ResponseJob.status == "running",
+                            ResponseJob.lease_expires_at.is_not(None),
+                            ResponseJob.lease_expires_at <= now,
+                        ),
+                    ),
+                )
+                .order_by(ResponseJob.available_at, ResponseJob.created_at)
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            job = (await session.exec(statement)).first()
+            if job is None:
+                return None
+            response = await session.get(ResponseRecord, job.response_id, with_for_update=True)
+            if response is None or response.status not in {"queued", "in_progress"}:
+                job.status = "completed"
+                job.updated_at = now
+                return None
+            job.status = "running"
+            job.attempt_count += 1
+            job.lease_owner = self._worker_id
+            job.heartbeat_at = now
+            job.lease_expires_at = now + timedelta(seconds=self.settings.agent_job_lease_seconds)
+            job.updated_at = now
+            record_agent_job_event(
+                event="claimed",
+                attempt=job.attempt_count,
+            )
+            return job.response_id, job.decision
+
+    async def _execute_claimed_job(self, response_id: str, decision: str | None) -> None:
+        execution_task = asyncio.current_task()
+        assert execution_task is not None
+        heartbeat = asyncio.create_task(
+            self._heartbeat_job(response_id, execution_task),
+            name=f"agent-heartbeat-{response_id}",
+        )
+        try:
+            async with asyncio.timeout(self.settings.agent_execution_timeout_seconds):
+                await self._run_response(response_id, decision=decision)
+        except TimeoutError:
+            logger.warning(
+                "Agent response exceeded execution timeout response_id={}",
+                response_id,
+            )
+            await self._fail_response(
+                response_id,
+                code="execution_timeout",
+                message="The response exceeded its maximum execution time.",
+                retryable=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        await self._finalize_response_job(response_id)
+
+    async def _heartbeat_job(
+        self,
+        response_id: str,
+        execution_task: asyncio.Task[None],
+    ) -> None:
+        heartbeat_interval = min(
+            self.settings.agent_job_heartbeat_seconds,
+            max(1, self.settings.agent_job_lease_seconds // 3),
+        )
+        interval = min(
+            heartbeat_interval,
+            self.settings.agent_cancellation_poll_seconds,
+        )
+        last_heartbeat = perf_counter()
+        while True:
+            await asyncio.sleep(interval)
+            now = _now()
+            async with self.database.session_factory.begin() as session:
+                job = await session.get(ResponseJob, response_id, with_for_update=True)
+                if job is not None and job.status == "cancelled":
+                    execution_task.cancel()
+                    return
+                if job is None or job.status != "running" or job.lease_owner != self._worker_id:
+                    return
+                if perf_counter() - last_heartbeat >= heartbeat_interval:
+                    job.heartbeat_at = now
+                    job.lease_expires_at = now + timedelta(
+                        seconds=self.settings.agent_job_lease_seconds
+                    )
+                    job.updated_at = now
+                    last_heartbeat = perf_counter()
+
+    async def _finalize_response_job(self, response_id: str) -> None:
+        async with self.database.session_factory.begin() as session:
+            job = await session.get(ResponseJob, response_id, with_for_update=True)
+            response = await session.get(ResponseRecord, response_id)
+            if job is None or job.lease_owner != self._worker_id:
+                return
+            status = response.status if response is not None else "failed"
+            job.status = (
+                "cancelled"
+                if status == "cancelled"
+                else "dead"
+                if status == "failed"
+                else "completed"
+            )
+            job.lease_owner = None
+            job.lease_expires_at = None
+            job.heartbeat_at = None
+            job.updated_at = _now()
+            record_agent_job_event(
+                event=job.status,
+                attempt=job.attempt_count,
+            )
+
+    async def _fail_exhausted_jobs(self) -> None:
+        now = _now()
+        exhausted: list[str] = []
+        async with self.database.session_factory.begin() as session:
+            jobs = list(
+                (
+                    await session.exec(
+                        select(ResponseJob)
+                        .where(
+                            ResponseJob.status == "running",
+                            ResponseJob.lease_expires_at <= now,
+                            ResponseJob.attempt_count >= ResponseJob.max_attempts,
+                        )
+                        .with_for_update(skip_locked=True)
+                    )
+                ).all()
+            )
+            for job in jobs:
+                job.status = "dead"
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.updated_at = now
+                exhausted.append(job.response_id)
+        for response_id in exhausted:
+            await self._fail_response(
+                response_id,
+                code="execution_attempts_exhausted",
+                message="The response could not be completed after repeated worker failures.",
+                retryable=False,
+            )
+
     async def _run_response(self, response_id: str, *, decision: str | None) -> None:
         lock = self._response_locks.setdefault(response_id, asyncio.Lock())
         async with lock:
             try:
                 response, session_state = await self._mark_in_progress(response_id)
                 execution_started = perf_counter()
-                await self.runtime.restore_session_state(
-                    response.runtime_session_id, session_state
+                await self.runtime.restore_session_state(response.runtime_session_id, session_state)
+                text = (
+                    "yes please"
+                    if decision == "approve"
+                    else "no"
+                    if decision == "reject"
+                    else _input_text(response.input_json)
                 )
-                text = "yes please" if decision == "approve" else "no" if decision == "reject" else _input_text(response.input_json)
                 output_text = ""
                 request = AgentTurnRequest(
                     session_id=response.runtime_session_id,
                     text=text,
+                    model_id=response.model_id,
                 )
                 tool_runs: dict[str, list[str]] = {}
                 tool_activity: list[dict[str, Any]] = []
@@ -705,8 +1234,7 @@ class AgentApiService:
                 turn_usage: dict[str, Any] | None = None
                 time_to_first_text_ms: float | None = None
                 output_item_id = (
-                    f"msg_{response_id.removeprefix('resp_')}"
-                    f"{'_resume' if decision else ''}"
+                    f"msg_{response_id.removeprefix('resp_')}{'_resume' if decision else ''}"
                 )
                 async for event in self.runtime.stream_turn(request):
                     if isinstance(event, ResponseStarted):
@@ -730,9 +1258,7 @@ class AgentApiService:
                             "status": "running",
                         }
                         if event.source == "subagent":
-                            activity_item.update(
-                                {"source": event.source, "agent": event.agent}
-                            )
+                            activity_item.update({"source": event.source, "agent": event.agent})
                         tool_activity.append(activity_item)
                         await self._append_event(
                             response_id,
@@ -748,20 +1274,14 @@ class AgentApiService:
                             f"{event.source}:{event.agent or 'root'}:{event.tool}"
                         )
                         pending_runs = tool_runs.get(correlation_key) or []
-                        tool_run_id = (
-                            pending_runs.pop(0) if pending_runs else _id("toolrun")
-                        )
+                        tool_run_id = pending_runs.pop(0) if pending_runs else _id("toolrun")
                         display_label = (
                             f"{event.label} · {event.agent}"
                             if event.source == "subagent" and event.agent
                             else event.label
                         )
                         activity = next(
-                            (
-                                item
-                                for item in reversed(tool_activity)
-                                if item["id"] == tool_run_id
-                            ),
+                            (item for item in reversed(tool_activity) if item["id"] == tool_run_id),
                             None,
                         )
                         if activity is None:
@@ -772,9 +1292,7 @@ class AgentApiService:
                                 "label": display_label,
                             }
                             if event.source == "subagent":
-                                activity.update(
-                                    {"source": event.source, "agent": event.agent}
-                                )
+                                activity.update({"source": event.source, "agent": event.agent})
                             tool_activity.append(activity)
                         activity["status"] = "succeeded"
                         if event.detail not in {"Completed", "Tool completed"}:
@@ -805,9 +1323,19 @@ class AgentApiService:
                             delta=delta,
                         )
                     elif isinstance(event, AgentError):
+                        if event.model_id and event.model_status in {
+                            "degraded",
+                            "unavailable",
+                        }:
+                            await self._record_model_availability(
+                                event.model_id,
+                                status=event.model_status,
+                                reason_code=event.code,
+                                detail=event.message,
+                            )
                         await self._fail_response(
                             response_id,
-                            code="agent_execution_failed",
+                            code=event.code,
                             message=event.message,
                             retryable=event.retryable,
                             usage=(
@@ -819,11 +1347,15 @@ class AgentApiService:
                         )
                         return
                     elif isinstance(event, ResponseCompleted):
+                        await self._record_model_availability(
+                            response.model_id,
+                            status="available",
+                            reason_code=None,
+                            detail="A recent request completed successfully",
+                        )
                         turn_completed = True
                         turn_usage = (
-                            event.usage.model_dump(mode="json")
-                            if event.usage is not None
-                            else None
+                            event.usage.model_dump(mode="json") if event.usage is not None else None
                         )
                 # AgentRuntime serializes each turn with its session lock. Read
                 # confirmation/history only after the generator has exited and
@@ -837,12 +1369,8 @@ class AgentApiService:
                         retryable=True,
                     )
                     return
-                pending = await self.runtime.pending_confirmation(
-                    response.runtime_session_id
-                )
-                state = await self.runtime.export_session_state(
-                    response.runtime_session_id
-                )
+                pending = await self.runtime.pending_confirmation(response.runtime_session_id)
+                state = await self.runtime.export_session_state(response.runtime_session_id)
                 if pending and decision is None:
                     await self._require_action(
                         response_id,
@@ -877,9 +1405,7 @@ class AgentApiService:
                     retryable=True,
                 )
 
-    async def _mark_in_progress(
-        self, response_id: str
-    ) -> tuple[ResponseRecord, dict[str, Any]]:
+    async def _mark_in_progress(self, response_id: str) -> tuple[ResponseRecord, dict[str, Any]]:
         async with self.database.session_factory.begin() as session:
             response = await session.get(ResponseRecord, response_id, with_for_update=True)
             if response is None:
@@ -895,22 +1421,16 @@ class AgentApiService:
                 else None
             )
             state = conversation.session_state if conversation else response.session_state
-            await self._append_event_in_session(
-                session, response, "response.in_progress", now=now
-            )
+            await self._append_event_in_session(session, response, "response.in_progress", now=now)
         await self.events.publish(response_id)
         return response, state
 
-    async def _append_event(
-        self, response_id: str, event_type: str, **fields: Any
-    ) -> None:
+    async def _append_event(self, response_id: str, event_type: str, **fields: Any) -> None:
         async with self.database.session_factory.begin() as session:
             response = await session.get(ResponseRecord, response_id, with_for_update=True)
             if response is None or response.status in TERMINAL_STATUSES:
                 return
-            await self._append_event_in_session(
-                session, response, event_type, **fields
-            )
+            await self._append_event_in_session(session, response, event_type, **fields)
         await self.events.publish(response_id)
 
     async def _append_event_in_session(
@@ -962,9 +1482,7 @@ class AgentApiService:
             now = _now()
             response.status = "completed"
             response.completed_at = now
-            response.output_json = _output_items(
-                output_item_id, output_text, tool_activity
-            )
+            response.output_json = _output_items(output_item_id, output_text, tool_activity)
             response.usage_json = _finalize_usage(
                 response,
                 usage,
@@ -981,6 +1499,7 @@ class AgentApiService:
                 now=now,
                 response=response_repr(response),
             )
+            await self._finish_job_in_session(session, response_id, "completed", now)
         await self.events.publish(response_id)
 
     async def _require_action(
@@ -998,9 +1517,7 @@ class AgentApiService:
         now = _now()
         pending_created_at = pending.get("created_at")
         expires_at = (
-            _as_utc(pending_created_at)
-            if isinstance(pending_created_at, datetime)
-            else now
+            _as_utc(pending_created_at) if isinstance(pending_created_at, datetime) else now
         ) + timedelta(seconds=self.settings.confirmation_ttl_seconds)
         action = RequiredAction(
             id=_id("act"),
@@ -1010,8 +1527,7 @@ class AgentApiService:
             type="confirmation",
             title=f"Change plan to {pending['plan_name']}",
             description=(
-                f"The monthly charge will be {pending['currency']} "
-                f"{pending['quoted_price']}."
+                f"The monthly charge will be {pending['currency']} {pending['quoted_price']}."
             ),
             expires_at=expires_at,
             decision=None,
@@ -1025,9 +1541,7 @@ class AgentApiService:
                 return
             session.add(action)
             response.status = "requires_action"
-            response.output_json = _output_items(
-                output_item_id, output_text, tool_activity
-            )
+            response.output_json = _output_items(output_item_id, output_text, tool_activity)
             response.required_action_json = required_action
             response.usage_json = _finalize_usage(
                 response,
@@ -1046,6 +1560,7 @@ class AgentApiService:
                 required_action=required_action,
                 response=response_repr(response),
             )
+            await self._finish_job_in_session(session, response_id, "completed", now)
         await self.events.publish(response_id)
         await self._schedule_expiry(action.id, response_id, expires_at)
 
@@ -1086,6 +1601,7 @@ class AgentApiService:
                 now=now,
                 response=response_repr(response),
             )
+            await self._finish_job_in_session(session, response_id, "dead", now)
         await self.events.publish(response_id)
 
     async def _set_cancelled(
@@ -1107,6 +1623,27 @@ class AgentApiService:
             "response.cancelled",
             now=now,
             response=response_repr(response),
+        )
+        await self._finish_job_in_session(session, response.id, "cancelled", now)
+
+    async def _finish_job_in_session(
+        self,
+        session,
+        response_id: str,
+        status: str,
+        now: datetime,
+    ) -> None:
+        job = await session.get(ResponseJob, response_id, with_for_update=True)
+        if job is None:
+            return
+        job.status = status
+        job.lease_owner = None
+        job.lease_expires_at = None
+        job.heartbeat_at = None
+        job.updated_at = now
+        record_agent_job_event(
+            event=status,
+            attempt=job.attempt_count,
         )
 
     async def _persist_conversation_state(
@@ -1132,13 +1669,9 @@ class AgentApiService:
         async with self.database.session_factory.begin() as session:
             response = await session.get(ResponseRecord, response_id, with_for_update=True)
             if response is not None:
-                await self._persist_conversation_state(
-                    session, response, state, _now()
-                )
+                await self._persist_conversation_state(session, response, state, _now())
 
-    async def _restore_session_for_response(
-        self, response: ResponseRecord
-    ) -> None:
+    async def _restore_session_for_response(self, response: ResponseRecord) -> None:
         async with self.database.session() as session:
             conversation = (
                 await session.get(Conversation, response.conversation_id)
@@ -1199,8 +1732,8 @@ class AgentApiService:
         if action:
             await self._expire_action(action.id, response_id)
 
-    async def _reconcile_interrupted_responses(self) -> None:
-        interrupted: list[tuple[str, UUID, dict[str, Any]]] = []
+    async def _reconcile_response_jobs(self) -> None:
+        """Backfill jobs without taking ownership from a healthy worker replica."""
         async with self.database.session_factory.begin() as session:
             responses = list(
                 (
@@ -1212,40 +1745,25 @@ class AgentApiService:
                 ).all()
             )
             for response in responses:
-                conversation = (
-                    await session.get(Conversation, response.conversation_id)
-                    if response.conversation_id
-                    else None
-                )
-                interrupted.append(
-                    (
-                        response.id,
-                        response.runtime_session_id,
-                        conversation.session_state
-                        if conversation
-                        else response.session_state,
-                    )
-                )
                 now = _now()
-                response.status = "failed"
-                response.completed_at = now
-                response.error_json = {
-                    "code": "server_restarted",
-                    "message": "Execution was interrupted by an agent service restart.",
-                    "retryable": True,
-                }
-                await self._append_event_in_session(
-                    session,
-                    response,
-                    "response.failed",
-                    now=now,
-                    response=response_repr(response),
-                )
-        for response_id, session_id, state in interrupted:
-            await self.runtime.restore_session_state(session_id, state)
-            await self.runtime.clear_confirmation(session_id)
-            cleared = await self.runtime.export_session_state(session_id)
-            await self._save_session_state_for_response(response_id, cleared)
+                job = await session.get(ResponseJob, response.id, with_for_update=True)
+                if job is None:
+                    session.add(
+                        ResponseJob(
+                            response_id=response.id,
+                            status="pending",
+                            decision=None,
+                            attempt_count=0,
+                            max_attempts=self.settings.agent_job_max_attempts,
+                            available_at=now,
+                            lease_owner=None,
+                            lease_expires_at=None,
+                            heartbeat_at=None,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+        self._work_available.set()
 
     async def _idempotency_lookup(
         self,
@@ -1307,8 +1825,7 @@ class AgentApiService:
                 resource_type=resource_type,
                 resource_id=resource_id,
                 created_at=now,
-                expires_at=now
-                + timedelta(hours=self.settings.api_idempotency_retention_hours),
+                expires_at=now + timedelta(hours=self.settings.api_idempotency_retention_hours),
             )
         )
 
@@ -1323,7 +1840,7 @@ def _finalize_usage(
     *,
     now: datetime,
     time_to_first_text_ms: float | None,
-    settings: Settings,
+    settings: AgentSettings,
     status: str,
 ) -> dict[str, Any]:
     started_at = _as_utc(response.started_at or now)

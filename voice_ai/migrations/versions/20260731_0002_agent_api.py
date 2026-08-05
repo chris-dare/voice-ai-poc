@@ -62,9 +62,7 @@ def upgrade() -> None:
         sa.Column("metadata_json", sa.JSON(), nullable=False),
         sa.Column("background", sa.Boolean(), nullable=False),
         sa.Column("stream", sa.Boolean(), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["conversation_id"], ["api_conversations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["conversation_id"], ["api_conversations.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(
@@ -78,8 +76,7 @@ def upgrade() -> None:
         ["conversation_id"],
         unique=True,
         postgresql_where=sa.text(
-            "conversation_id IS NOT NULL AND status IN "
-            "('queued', 'in_progress', 'requires_action')"
+            "conversation_id IS NOT NULL AND status IN ('queued', 'in_progress', 'requires_action')"
         ),
     )
 

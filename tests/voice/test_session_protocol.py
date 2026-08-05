@@ -96,9 +96,7 @@ async def test_conversation_deep_link_serves_spa_entrypoint(tmp_path) -> None:
         transport=ASGITransport(app=app),
         base_url="http://test",
     ) as client:
-        response = await client.get(
-            "/conversations/conv_c35053a9c86649eba8f302527fd33574"
-        )
+        response = await client.get("/conversations/conv_c35053a9c86649eba8f302527fd33574")
 
     assert response.status_code == 200
     assert response.text == "<html>conversation app</html>"
@@ -164,9 +162,7 @@ async def test_voice_initialization_retries_transient_dependency_failure(
 
 
 @pytest.mark.asyncio
-async def test_authenticated_voice_offer_binds_to_owned_conversation(
-    tmp_path, monkeypatch
-) -> None:
+async def test_authenticated_voice_offer_binds_to_owned_conversation(tmp_path, monkeypatch) -> None:
     class FakeRequestHandler:
         def __init__(self, **_kwargs) -> None:
             pass
@@ -207,6 +203,7 @@ async def test_authenticated_voice_offer_binds_to_owned_conversation(
                 headers={
                     "Authorization": "Bearer user-token",
                     "X-Conversation-Id": "conv_test",
+                    "X-Model-Id": "test:assistant",
                 },
                 json={"sdp": "offer", "type": "offer"},
             )
@@ -215,3 +212,51 @@ async def test_authenticated_voice_offer_binds_to_owned_conversation(
     validate.assert_awaited_once()
     assert validate.await_args.kwargs["access_token"] == "user-token"
     assert validate.await_args.kwargs["conversation_id"] == "conv_test"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_voice_offer_requires_model_selection(tmp_path, monkeypatch) -> None:
+    class FakeRequestHandler:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def handle_web_request(self, **_kwargs):
+            return {"pc_id": "pc_test", "sdp": "answer", "type": "answer"}
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "voice_ai.voice.runtime.SmallWebRTCRequestHandler",
+        FakeRequestHandler,
+    )
+    monkeypatch.setattr(
+        "voice_ai.voice.runtime.run_voice_checks",
+        AsyncMock(return_value=[]),
+    )
+    app = create_app(
+        Settings(
+            api_enabled=True,
+            auth0_domain="tenant.example.auth0.com",
+            auth0_audience="https://agent.example.com",
+            auth0_spa_client_id="spa-client-id",
+            frontend_dist=tmp_path,
+        )
+    )
+    async with app.router.lifespan_context(app):
+        await app.state.voice_initialization
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/offer",
+                headers={
+                    "Authorization": "Bearer user-token",
+                    "X-Conversation-Id": "conv_test",
+                },
+                json={"sdp": "offer", "type": "offer"},
+            )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "A model selection is required for voice"
