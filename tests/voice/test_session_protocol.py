@@ -4,10 +4,16 @@ import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from voice_ai.shared.config import Settings
-from voice_ai.voice.app import SessionCapacity, _run_session_lazy, create_app
+from voice_ai.voice.app import (
+    SessionCapacity,
+    _require_audio_only_offer,
+    _run_session_lazy,
+    create_app,
+)
 from voice_ai.voice.health import CheckResult
 from voice_ai.voice.runtime import run_session
 
@@ -27,6 +33,22 @@ async def test_voice_session_capacity_emits_admission_and_saturation_metrics(mon
         {"event": "rejected", "active": 1},
         {"event": "released", "active": 0},
     ]
+
+
+def test_voice_offer_accepts_audio_only_sdp() -> None:
+    _require_audio_only_offer(
+        {"sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP"}
+    )
+
+
+def test_voice_offer_rejects_video_before_webrtc_processing() -> None:
+    with pytest.raises(HTTPException) as error:
+        _require_audio_only_offer(
+            {"sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 96"}
+        )
+
+    assert getattr(error.value, "status_code", None) == 422
+    assert getattr(error.value, "detail", None) == "Voice sessions accept audio media only"
 
 
 @pytest.mark.asyncio

@@ -360,6 +360,7 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
     ) -> dict[str, str] | None:
         if voice_runtime is None or voice_status in {"warming", "not_ready"}:
             raise HTTPException(503, "Voice services are still warming up; inspect /healthz")
+        _require_audio_only_offer(request)
         voice_request = voice_runtime.parse_offer(request)
         public_access_token: str | None = None
         conversation_id: str | None = None
@@ -502,6 +503,15 @@ def _bearer_token(authorization: str | None) -> str:
     if not token:
         raise HTTPException(401, "A bearer access token is required")
     return token
+
+
+def _require_audio_only_offer(payload: dict[str, Any]) -> None:
+    """Reject video media before untrusted SDP reaches the WebRTC decoder stack."""
+    sdp = payload.get("sdp")
+    if not isinstance(sdp, str):
+        return
+    if any(line.strip().lower().startswith("m=video") for line in sdp.splitlines()):
+        raise HTTPException(422, "Voice sessions accept audio media only")
 
 
 async def _validate_voice_conversation(
