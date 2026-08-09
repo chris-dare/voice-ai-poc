@@ -1068,7 +1068,7 @@ class AgentApiService:
             if presence is not None:
                 presence.cancel()
                 await asyncio.gather(presence, return_exceptions=True)
-            await self._record_worker_presence("stopped")
+            await self._record_stopped_worker_presence()
 
     def _response_task_finished(
         self,
@@ -1123,6 +1123,19 @@ class AgentApiService:
                 node.status = status
                 node.concurrency = self.settings.agent_worker_concurrency
                 node.heartbeat_at = now
+
+    async def _record_stopped_worker_presence(self) -> None:
+        try:
+            await self._record_worker_presence("stopped")
+        except Exception as exc:
+            # This marker only shortens the readiness expiry window. When the
+            # database is unavailable during shutdown, the existing heartbeat
+            # becomes stale and is reconciled by the next healthy worker.
+            logger.warning(
+                "Could not mark the agent worker stopped during shutdown; "
+                "its presence will expire automatically error_type={}",
+                type(exc).__name__,
+            )
 
     async def worker_readiness(self) -> dict[str, Any]:
         cutoff = _now() - timedelta(seconds=self.settings.agent_worker_presence_ttl_seconds)

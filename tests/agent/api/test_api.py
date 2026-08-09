@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
@@ -1211,6 +1211,20 @@ async def test_worker_reconciles_stale_presence_and_marks_itself_stopped(tmp_pat
         stopped = await session.get(WorkerNode, service._worker_id)
     assert stopped is not None
     assert stopped.status == "stopped"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_shutdown_tolerates_an_unavailable_database(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'worker-stop.db'}")
+    service = AgentApiService(
+        Settings(database_url=str(database.engine.url)), database, FakeRuntime()
+    )  # type: ignore[arg-type]
+    service._record_worker_presence = AsyncMock(side_effect=RuntimeError("database unavailable"))
+
+    await service._record_stopped_worker_presence()
+
+    service._record_worker_presence.assert_awaited_once_with("stopped")
     await database.close()
 
 
