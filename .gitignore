@@ -9,6 +9,7 @@
 __pycache__/
 *.py[cod]
 .coverage
+coverage.xml
 htmlcov/
 frontend/node_modules/
 frontend/dist/
