@@ -67,6 +67,7 @@ services:
       context: .
       args:
         WHISPER_MODEL: ${WHISPER_MODEL:-base}
+        WHISPER_REVISION: ${WHISPER_REVISION:-ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66}
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,6 +81,7 @@ services:
       context: .
       args:
         WHISPER_MODEL: ${WHISPER_MODEL:-base}
+        WHISPER_REVISION: ${WHISPER_REVISION:-ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -138,6 +140,7 @@ services:
       context: .
       args:
         WHISPER_MODEL: ${WHISPER_MODEL:-base}
+        WHISPER_REVISION: ${WHISPER_REVISION:-ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -178,6 +181,7 @@ services:
       context: .
       args:
         WHISPER_MODEL: ${WHISPER_MODEL:-base}
+        WHISPER_REVISION: ${WHISPER_REVISION:-ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66}
     depends_on:
       agent:
         condition: service_healthy
@@ -185,6 +189,7 @@ services:
       AGENT_BASE_URL: http://agent:8100
       AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:-local-agent-secret}
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      WHISPER_REVISION: ${WHISPER_REVISION:-ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66}
       KOKORO_VOICE: ${KOKORO_VOICE:-af_heart}
       MODEL_CACHE_DIR: /app/models
       FRONTEND_DIST: /app/frontend/dist

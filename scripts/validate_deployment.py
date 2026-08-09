@@ -39,6 +39,12 @@ def _validate_build_context(errors: list[str]) -> None:
     missing = sorted(required - ignored)
     if missing:
         errors.append(f".dockerignore does not exclude: {', '.join(missing)}")
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    from_lines = [
+        line.strip() for line in dockerfile.splitlines() if line.lstrip().startswith("FROM ")
+    ]
+    if not from_lines or any("@sha256:" not in line for line in from_lines):
+        errors.append("every Dockerfile base image must be pinned by sha256 digest")
 
 
 def _validate_local(services: dict[str, Any], *, local_model: bool) -> list[str]:
@@ -125,6 +131,9 @@ def _validate_production(services: dict[str, Any]) -> list[str]:
         errors.append("voice gateway must have a positive session limit")
     if int(voice_env.get("VOICE_MAX_REQUEST_BODY_BYTES") or 0) <= 0:
         errors.append("voice gateway must have a positive HTTP request-body limit")
+    whisper_revision = str(voice_env.get("WHISPER_REVISION") or "")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", whisper_revision):
+        errors.append("voice gateway must pin Whisper to a full commit SHA")
 
     migrate_env = services.get("migrate", {}).get("environment", {})
     if set(migrate_env) != {"DATABASE_URL"}:

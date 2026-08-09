@@ -112,6 +112,7 @@ services:
     environment:
       AGENT_BASE_URL: http://agent:8100
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      WHISPER_REVISION: ${WHISPER_REVISION:?WHISPER_REVISION must pin the model commit}
       KOKORO_VOICE: ${KOKORO_VOICE:-af_heart}
       MODEL_CACHE_DIR: /app/models
       FRONTEND_DIST: /app/frontend/dist

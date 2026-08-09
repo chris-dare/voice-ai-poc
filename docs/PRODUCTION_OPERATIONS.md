@@ -93,6 +93,7 @@ LOGFIRE_CAPTURE_CONTENT=false
 DEPLOYMENT_PROFILE=public
 PUBLIC_BASE_URL=https://...
 ICE_SERVERS=[{"urls":"turns:...","username":"...","credential":"..."}]
+WHISPER_REVISION=<full-40-character-model-repository-commit>
 VOICE_MAX_REQUEST_BODY_BYTES=1048576
 ```
 
@@ -109,6 +110,11 @@ Both services enforce their configured raw HTTP body limit while receiving the b
 chunked requests and clients that declare an incorrect `Content-Length`. Set the TLS ingress body
 limit at or below the corresponding application limit so oversized requests are rejected before
 they consume a replica's application memory.
+The container build pins both base-image manifests and the Whisper repository revision. Kokoro and
+NLTK artifacts are verified against embedded SHA-256 digests before they replace cached files.
+Changing a voice model or base image therefore requires an explicit reviewed pin update. Runtime
+application and model files remain root-owned and read-only to the unprivileged service account;
+only the explicitly configured tmpfs paths are writable.
 
 The API `/readyz` endpoint requires at least one recently heartbeating response worker whenever the
 public API is enabled. Start workers independently from API readiness (both may depend on the
