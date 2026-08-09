@@ -217,6 +217,7 @@ jobs:
           sbom: voice-ai.spdx.json
           fail-build: true
           severity-cutoff: critical
+          vex: security/openvex.json
           output-format: table
 
       - name: Build the production image
@@ -266,6 +267,7 @@ jobs:
           fail-build: true
           severity-cutoff: high
           only-fixed: true
+          vex: security/openvex.json
           output-format: table
 
   semgrep:

@@ -1,0 +1,77 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/chris-dare/voice-ai-poc/security/vex/CVE-2026-5450-2026-08-09",
+  "author": "Voice AI maintainers",
+  "timestamp": "2026-08-09T11:50:16Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "@id": "CVE-2026-5450"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc-bin@2.41-12%2Bdeb13u3?arch=amd64&distro=debian-13&upstream=glibc"
+        },
+        {
+          "@id": "pkg:deb/debian/libc6@2.41-12%2Bdeb13u3?arch=amd64&distro=debian-13&upstream=glibc"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "impact_statement": "The vulnerable glibc scanf path requires a native caller-controlled format using the allocating %mc conversion with an explicit width greater than 1024. Voice AI does not construct native scanf format strings from user input and exposes no application path using that format. Debian classifies this package version as no-DSA/won't-fix. Reassess this statement when the Debian base digest, glibc version, or native input-processing stack changes."
+    },
+    {
+      "vulnerability": {
+        "@id": "CVE-2026-8461"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/ffmpeg@8.1.1"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "This issue is in FFmpeg's MagicYUV video decoder bundled by PyAV. Voice AI accepts audio media only and rejects every WebRTC offer containing an m=video section before SDP reaches aiortc, PyAV, or FFmpeg. The decoder is therefore outside the service's executable request path. Reassess this statement if video input is introduced or aiortc accepts media outside the validated offer."
+    },
+    {
+      "vulnerability": {
+        "@id": "CVE-2026-11940"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/python@3.13.14"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "This issue requires extracting an attacker-controlled tar archive through Python's tarfile module. The production application and installed agent/voice runtime do not import tarfile or expose archive extraction. Reassess this statement if file upload, archive extraction, plugin installation, or dynamic package installation is added."
+    },
+    {
+      "vulnerability": {
+        "@id": "CVE-2026-15308"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/python@3.13.14"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "This issue requires parsing attacker-controlled markup with Python's html.parser.HTMLParser. The production application and installed agent/voice runtime do not import HTMLParser or html.parser; external content retrieval does not use this parser. Reassess this statement if HTMLParser-based ingestion is introduced."
+    },
+    {
+      "vulnerability": {
+        "@id": "CVE-2026-11972"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/python@3.13.14"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "This issue requires streaming an attacker-controlled truncated archive through Python's tarfile module. The production application and installed agent/voice runtime do not import tarfile or expose archive streaming or extraction. Reassess this statement if file upload, archive extraction, plugin installation, or dynamic package installation is added."
+    }
+  ]
+}
