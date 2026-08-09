@@ -683,6 +683,7 @@ async def test_http_boundary_returns_problem_details_and_protocol_headers(tmp_pa
         api_enabled=True,
         auth0_domain="tenant.example.auth0.com",
         auth0_audience="https://voice-api.example.com",
+        api_max_request_body_bytes=1_024,
     )
     app = create_agent_app(settings, token_verifier=StaticVerifier())
     async with app.router.lifespan_context(app):
@@ -690,6 +691,20 @@ async def test_http_boundary_returns_problem_details_and_protocol_headers(tmp_pa
             transport=ASGITransport(app=app),
             base_url="http://test",
         ) as client:
+
+            async def oversized_body():
+                yield b"{" + (b'"padding":"' + (b"x" * 1_024))
+                yield b'"}'
+
+            oversized = await client.post(
+                "/v1/conversations",
+                headers={"Content-Type": "application/json"},
+                content=oversized_body(),
+            )
+            assert oversized.status_code == 413
+            assert oversized.json()["code"] == "request_body_too_large"
+            assert oversized.json()["request_id"] == oversized.headers["x-request-id"]
+
             unauthorized = await client.post(
                 "/v1/conversations",
                 json={"agent_id": "agent_general_assistant"},

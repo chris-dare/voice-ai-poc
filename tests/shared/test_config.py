@@ -7,13 +7,16 @@ def test_deployed_services_only_load_their_owned_configuration() -> None:
     assert "agent_model" in AgentSettings.model_fields
     assert "database_url" in AgentSettings.model_fields
     assert "openrouter_api_key" in AgentSettings.model_fields
+    assert "api_max_request_body_bytes" in AgentSettings.model_fields
     assert "whisper_model" not in AgentSettings.model_fields
     assert "kokoro_voice" not in AgentSettings.model_fields
+    assert "voice_max_request_body_bytes" not in AgentSettings.model_fields
 
     assert "whisper_model" in VoiceSettings.model_fields
     assert "kokoro_voice" in VoiceSettings.model_fields
     assert "agent_model" not in VoiceSettings.model_fields
     assert "database_url" not in VoiceSettings.model_fields
+    assert "api_max_request_body_bytes" not in VoiceSettings.model_fields
 
 
 def test_public_agent_profile_rejects_unsafe_process_configuration() -> None:

@@ -115,6 +115,7 @@ class AgentSettings(AuthSettings):
         le=1_000_000,
         validation_alias=AliasChoices("API_MAX_INPUT_CHARS", "PUBLIC_API_MAX_INPUT_CHARS"),
     )
+    api_max_request_body_bytes: int = Field(default=1_048_576, ge=1_024, le=100_000_000)
     confirmation_ttl_seconds: int = Field(default=300, ge=30, le=3_600)
     agent_model: str = ""
     agent_models: Annotated[list[str], NoDecode] = Field(default_factory=list)

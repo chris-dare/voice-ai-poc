@@ -21,6 +21,7 @@ from voice_ai.agent.persistence.database import Database
 from voice_ai.agent.protocol import AgentTurnRequest
 from voice_ai.agent.runtime import AgentRuntime
 from voice_ai.shared.config import AgentSettings, get_agent_settings
+from voice_ai.shared.http import request_body_limit
 from voice_ai.shared.observability import (
     configure_observability,
     instrument_fastapi,
@@ -86,6 +87,7 @@ def create_agent_app(
         await database.close()
 
     app = FastAPI(title=f"{configured.app_name} Agent", lifespan=lifespan)
+    request_body_limit(app, max_bytes=configured.api_max_request_body_bytes)
     app.include_router(
         create_api_router(
             api_service,
