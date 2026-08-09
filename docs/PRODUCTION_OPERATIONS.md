@@ -72,6 +72,7 @@ AUTH0_DOMAIN=<tenant>
 AUTH0_AUDIENCE=<api-identifier>
 AUTH0_SPA_CLIENT_ID=<browser-application-client-id>
 DATABASE_URL=postgresql+asyncpg://...
+API_MAX_REQUEST_BODY_BYTES=1048576
 AGENT_QUEUE_CAPACITY=1000
 AGENT_TENANT_ACTIVE_RESPONSE_LIMIT=25
 AGENT_MODEL_ROUTE_CONCURRENCY=8
@@ -92,6 +93,7 @@ LOGFIRE_CAPTURE_CONTENT=false
 DEPLOYMENT_PROFILE=public
 PUBLIC_BASE_URL=https://...
 ICE_SERVERS=[{"urls":"turns:...","username":"...","credential":"..."}]
+VOICE_MAX_REQUEST_BODY_BYTES=1048576
 ```
 
 Supply secrets through the platform secret store, not images, Compose files, or source control.
@@ -103,6 +105,10 @@ The public voice profile also refuses to start without API authentication, compl
 settings, HTTPS, and a TURN server. Each active WebRTC peer ID is bound to a one-way fingerprint
 of the access token that created it, so renegotiation and ICE candidate requests cannot cross user
 sessions and raw bearer tokens are never retained.
+Both services enforce their configured raw HTTP body limit while receiving the body, including
+chunked requests and clients that declare an incorrect `Content-Length`. Set the TLS ingress body
+limit at or below the corresponding application limit so oversized requests are rejected before
+they consume a replica's application memory.
 
 The API `/readyz` endpoint requires at least one recently heartbeating response worker whenever the
 public API is enabled. Start workers independently from API readiness (both may depend on the

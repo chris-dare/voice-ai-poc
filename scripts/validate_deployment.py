@@ -100,6 +100,8 @@ def _validate_production(services: dict[str, Any]) -> list[str]:
         errors.append("agent internal credential must contain at least 32 characters")
     if agent_env.get("AGENT_HOST") != "0.0.0.0":
         errors.append("agent must bind inside its container network")
+    if int(agent_env.get("API_MAX_REQUEST_BODY_BYTES") or 0) <= 0:
+        errors.append("agent must have a positive HTTP request-body limit")
 
     voice_env = services.get("voice-gateway", {}).get("environment", {})
     if voice_env.get("DEPLOYMENT_PROFILE") != "public":
@@ -121,6 +123,8 @@ def _validate_production(services: dict[str, Any]) -> list[str]:
         errors.append("voice gateway ICE_SERVERS must contain a TURN URL")
     if int(voice_env.get("MAX_CONCURRENT_SESSIONS") or 0) <= 0:
         errors.append("voice gateway must have a positive session limit")
+    if int(voice_env.get("VOICE_MAX_REQUEST_BODY_BYTES") or 0) <= 0:
+        errors.append("voice gateway must have a positive HTTP request-body limit")
 
     migrate_env = services.get("migrate", {}).get("environment", {})
     if set(migrate_env) != {"DATABASE_URL"}:
