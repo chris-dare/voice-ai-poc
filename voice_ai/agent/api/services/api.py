@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from loguru import logger
 from pydantic_ai.models import parse_model_id
-from sqlalchemy import and_, delete, func, or_, text
+from sqlalchemy import and_, delete, func, or_, text, update
 from sqlmodel import select
 
 from voice_ai.agent.api.auth import AuthContext
@@ -1021,11 +1021,14 @@ class AgentApiService:
             self._worker_id,
             self.settings.agent_worker_concurrency,
         )
-        presence = asyncio.create_task(
-            self._worker_presence_loop(),
-            name="agent-worker-presence",
-        )
+        presence: asyncio.Task[None] | None = None
         try:
+            await self._expire_stale_workers()
+            await self._record_worker_presence("active")
+            presence = asyncio.create_task(
+                self._worker_presence_loop(),
+                name="agent-worker-presence",
+            )
             while True:
                 self._tasks = {
                     response_id: task
@@ -1062,8 +1065,9 @@ class AgentApiService:
                 except TimeoutError:
                     await self._fail_exhausted_jobs()
         finally:
-            presence.cancel()
-            await asyncio.gather(presence, return_exceptions=True)
+            if presence is not None:
+                presence.cancel()
+                await asyncio.gather(presence, return_exceptions=True)
             await self._record_worker_presence("stopped")
 
     def _response_task_finished(
@@ -1088,6 +1092,18 @@ class AgentApiService:
         while True:
             await self._record_worker_presence("active")
             await asyncio.sleep(max(2, self.settings.agent_worker_presence_ttl_seconds // 3))
+
+    async def _expire_stale_workers(self) -> None:
+        cutoff = _now() - timedelta(seconds=self.settings.agent_worker_presence_ttl_seconds)
+        async with self.database.session_factory.begin() as session:
+            await session.exec(
+                update(WorkerNode)
+                .where(
+                    WorkerNode.status == "active",
+                    WorkerNode.heartbeat_at < cutoff,
+                )
+                .values(status="stopped")
+            )
 
     async def _record_worker_presence(self, status: str) -> None:
         now = _now()

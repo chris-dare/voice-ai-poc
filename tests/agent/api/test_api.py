@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from voice_ai.agent.api.auth import AuthContext
-from voice_ai.agent.api.models import ResponseJob
+from voice_ai.agent.api.models import ResponseJob, WorkerNode
 from voice_ai.agent.api.router import SharedFixedWindowRateLimiter, create_api_router
 from voice_ai.agent.api.schemas import (
     ConversationCreateRequest,
@@ -1151,6 +1151,55 @@ async def test_public_api_readiness_requires_a_live_response_worker(
 
     assert response.status_code == 503
     assert response.json()["response_workers"]["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_worker_reconciles_stale_presence_and_marks_itself_stopped(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'worker-presence.db'}")
+    await database.create_schema()
+    settings = Settings(
+        database_url=str(database.engine.url),
+        agent_worker_presence_ttl_seconds=5,
+        agent_job_poll_seconds=0.05,
+    )
+    stale_heartbeat = datetime.now(UTC) - timedelta(minutes=1)
+    async with database.session_factory.begin() as session:
+        session.add(
+            WorkerNode(
+                id="stale-worker",
+                status="active",
+                concurrency=4,
+                started_at=stale_heartbeat,
+                heartbeat_at=stale_heartbeat,
+            )
+        )
+
+    service = AgentApiService(settings, database, FakeRuntime())  # type: ignore[arg-type]
+    worker = asyncio.create_task(service.run_worker_forever())
+    try:
+        for _attempt in range(20):
+            async with database.session() as session:
+                current = await session.get(WorkerNode, service._worker_id)
+            if current is not None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("Worker presence was not registered")
+
+        async with database.session() as session:
+            stale = await session.get(WorkerNode, "stale-worker")
+        assert stale is not None
+        assert stale.status == "stopped"
+        assert current.status == "active"
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    async with database.session() as session:
+        stopped = await session.get(WorkerNode, service._worker_id)
+    assert stopped is not None
+    assert stopped.status == "stopped"
+    await database.close()
 
 
 @pytest.mark.asyncio

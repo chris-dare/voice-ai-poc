@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -89,11 +90,43 @@ async def _run_worker() -> None:
     try:
         await runtime.startup()
         await service.startup(start_worker=False)
-        await service.run_worker_forever()
+        await _run_until_termination(service.run_worker_forever())
     finally:
         await service.shutdown()
         await runtime.shutdown()
         await database.close()
+
+
+async def _run_until_termination(worker: Awaitable[None]) -> None:
+    """Cancel a long-running worker cleanly when the process receives a stop signal."""
+    loop = asyncio.get_running_loop()
+    stop_requested = asyncio.Event()
+    installed_signals: list[signal.Signals] = []
+    for process_signal in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(process_signal, stop_requested.set)
+        except (NotImplementedError, RuntimeError):
+            continue
+        installed_signals.append(process_signal)
+
+    worker_task = asyncio.create_task(worker, name="agent-worker-main")
+    stop_task = asyncio.create_task(stop_requested.wait(), name="agent-worker-stop-signal")
+    try:
+        done, _pending = await asyncio.wait(
+            {worker_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if worker_task in done:
+            await worker_task
+            return
+        worker_task.cancel()
+        await asyncio.gather(worker_task, return_exceptions=True)
+    finally:
+        stop_task.cancel()
+        worker_task.cancel()
+        await asyncio.gather(stop_task, worker_task, return_exceptions=True)
+        for process_signal in installed_signals:
+            loop.remove_signal_handler(process_signal)
 
 
 @app.command()
