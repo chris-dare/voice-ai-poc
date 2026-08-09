@@ -238,6 +238,7 @@ class VoiceSettings(AuthSettings):
     agent_base_url: str = "http://127.0.0.1:8100"
     agent_shared_secret: str | None = None
     whisper_model: str = "base"
+    whisper_revision: str = "ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66"
     kokoro_voice: str = "af_heart"
     model_cache_dir: Path = Path("models")
     deployment_profile: Literal["laptop", "public"] = "laptop"
@@ -260,6 +261,10 @@ class VoiceSettings(AuthSettings):
     def kokoro_download_dir(self) -> Path:
         return self.model_cache_dir / "kokoro"
 
+    @property
+    def whisper_cache_dir(self) -> Path:
+        return self.model_cache_dir / "whisper"
+
     def public_profile_errors(self) -> list[str]:
         errors: list[str] = []
         if self.deployment_profile == "public":
@@ -271,6 +276,10 @@ class VoiceSettings(AuthSettings):
                 errors.append("AUTH0_SPA_CLIENT_ID is required in the public voice profile")
             if not self.public_base_url or not self.public_base_url.startswith("https://"):
                 errors.append("PUBLIC_BASE_URL must be an https:// URL in the public profile")
+            if len(self.whisper_revision) != 40 or any(
+                character not in "0123456789abcdef" for character in self.whisper_revision.lower()
+            ):
+                errors.append("WHISPER_REVISION must be a full 40-character commit SHA")
             has_turn = any(
                 any(str(url).startswith(("turn:", "turns:")) for url in _urls(server.urls))
                 for server in self.ice_servers

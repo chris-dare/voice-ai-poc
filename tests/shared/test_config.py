@@ -13,6 +13,7 @@ def test_deployed_services_only_load_their_owned_configuration() -> None:
     assert "voice_max_request_body_bytes" not in AgentSettings.model_fields
 
     assert "whisper_model" in VoiceSettings.model_fields
+    assert "whisper_revision" in VoiceSettings.model_fields
     assert "kokoro_voice" in VoiceSettings.model_fields
     assert "voice_max_request_body_bytes" in VoiceSettings.model_fields
     assert "agent_model" not in VoiceSettings.model_fields
@@ -67,6 +68,22 @@ def test_public_profile_requires_https_and_turn() -> None:
     assert any("AUTH0_SPA_CLIENT_ID" in error for error in errors)
     assert any("https://" in error for error in errors)
     assert any("TURN" in error for error in errors)
+
+
+def test_public_voice_profile_requires_a_pinned_whisper_revision() -> None:
+    settings = VoiceSettings(
+        _env_file=None,
+        deployment_profile="public",
+        api_enabled=True,
+        auth0_domain="tenant.example.auth0.com",
+        auth0_audience="https://agent.example.com",
+        auth0_spa_client_id="spa-client-id",
+        public_base_url="https://voice.example",
+        ice_servers=[{"urls": "turns:turn.example:443"}],
+        whisper_revision="main",
+    )
+
+    assert any("WHISPER_REVISION" in error for error in settings.public_profile_errors())
 
 
 def test_ice_servers_parse_from_environment_shape() -> None:

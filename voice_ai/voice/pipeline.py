@@ -67,6 +67,8 @@ def create_voice_session(
 
     stt = LocalWhisperSTTService(
         model=settings.whisper_model,
+        revision=settings.whisper_revision,
+        cache_dir=settings.whisper_cache_dir,
         language="en",
         no_speech_prob=0.4,
         device="cpu",

@@ -288,7 +288,14 @@ async def _doctor(*, fix: bool, offline: bool, smoke: bool) -> int:
 async def _apply_fixes(settings: Any, database: Any) -> None:
     actions: list[tuple[str, Callable[[], Awaitable[None]]]] = [
         ("Building the local browser bundle", _build_frontend),
-        ("Downloading the Whisper model", lambda: _download_whisper(settings.whisper_model)),
+        (
+            "Downloading the Whisper model",
+            lambda: _download_whisper(
+                settings.whisper_model,
+                settings.whisper_revision,
+                settings.whisper_cache_dir,
+            ),
+        ),
         ("Downloading the sentence tokenizer", lambda: _download_nltk(settings)),
         ("Downloading the Kokoro voice model", lambda: _download_kokoro(settings)),
         (
@@ -333,10 +340,15 @@ async def _build_frontend() -> None:
         raise RuntimeError(stderr.decode("utf-8", "replace"))
 
 
-async def _download_whisper(model: str) -> None:
+async def _download_whisper(model: str, revision: str, cache_dir: Path) -> None:
     from faster_whisper.utils import download_model
 
-    await asyncio.to_thread(download_model, model)
+    await asyncio.to_thread(
+        download_model,
+        model,
+        cache_dir=str(cache_dir),
+        revision=revision,
+    )
 
 
 async def _download_nltk(settings) -> None:
@@ -388,6 +400,8 @@ async def _smoke_check(settings: Any) -> Any:
             settings.whisper_model,
             device="cpu",
             compute_type="int8",
+            download_root=str(settings.whisper_cache_dir),
+            revision=settings.whisper_revision,
         )
 
         def transcribe_silence() -> None:

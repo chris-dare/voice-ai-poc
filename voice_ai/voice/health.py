@@ -12,6 +12,7 @@ from faster_whisper.utils import download_model
 from voice_ai.agent.models import ModelReadiness, check_configured_model
 from voice_ai.agent.persistence.database import Database
 from voice_ai.shared.config import VoiceSettings
+from voice_ai.voice.speech.assets import kokoro_assets_valid
 
 Status = Literal["pass", "warn", "fail"]
 
@@ -36,7 +37,7 @@ async def run_checks(
 ) -> tuple[list[CheckResult], ModelReadiness]:
     model_task = asyncio.create_task(check_configured_model(settings))
     database_task = asyncio.create_task(_database_check(settings, database))
-    whisper_task = asyncio.create_task(asyncio.to_thread(_whisper_check, settings.whisper_model))
+    whisper_task = asyncio.create_task(asyncio.to_thread(_whisper_check, settings))
     checks = [
         await database_task,
         await whisper_task,
@@ -58,7 +59,7 @@ async def run_voice_checks(
 ) -> list[CheckResult]:
     """Check only dependencies owned by the public voice gateway."""
     agent_task = asyncio.create_task(_agent_service_check(settings))
-    whisper_task = asyncio.create_task(asyncio.to_thread(_whisper_check, settings.whisper_model))
+    whisper_task = asyncio.create_task(asyncio.to_thread(_whisper_check, settings))
     checks = [
         await agent_task,
         await whisper_task,
@@ -134,28 +135,31 @@ async def _database_check(settings: VoiceSettings, database: Database) -> CheckR
         )
 
 
-def _whisper_check(model: str) -> CheckResult:
+def _whisper_check(settings: VoiceSettings) -> CheckResult:
     try:
-        path = download_model(model, local_files_only=True)
-        return CheckResult("Whisper", "pass", f"{model} is cached at {path}")
+        path = download_model(
+            settings.whisper_model,
+            local_files_only=True,
+            cache_dir=str(settings.whisper_cache_dir),
+            revision=settings.whisper_revision,
+        )
+        return CheckResult("Whisper", "pass", f"{settings.whisper_model} is cached at {path}")
     except Exception:
         return CheckResult(
             "Whisper",
             "fail",
-            f"{model} is not in the local model cache",
+            f"{settings.whisper_model} is not in the pinned local model cache",
             "uv run voice-ai doctor --fix --yes",
         )
 
 
 def _tts_check(settings: VoiceSettings) -> CheckResult:
-    model = settings.kokoro_download_dir / "kokoro-v1.0.onnx"
-    voices = settings.kokoro_download_dir / "voices-v1.0.bin"
-    if model.is_file() and voices.is_file():
+    if kokoro_assets_valid(settings.kokoro_download_dir):
         return CheckResult("Kokoro", "pass", f"{settings.kokoro_voice} is cached")
     return CheckResult(
         "Kokoro",
         "fail",
-        f"{settings.kokoro_voice} is missing",
+        f"{settings.kokoro_voice} is missing or failed checksum validation",
         "uv run voice-ai doctor --fix --yes",
     )
 

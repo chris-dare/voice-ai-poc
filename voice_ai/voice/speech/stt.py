@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import numpy as np
 from faster_whisper import WhisperModel
@@ -25,6 +26,8 @@ class LocalWhisperSTTService(SegmentedSTTService):
         self,
         *,
         model: str = "base",
+        revision: str | None = None,
+        cache_dir: Path | None = None,
         language: str = "en",
         no_speech_prob: float = 0.4,
         device: str = "cpu",
@@ -37,7 +40,13 @@ class LocalWhisperSTTService(SegmentedSTTService):
         )
         self._no_speech_prob = no_speech_prob
         logger.info("Loading Faster Whisper model {} on {}", model, device)
-        self._model = WhisperModel(model, device=device, compute_type=compute_type)
+        self._model = WhisperModel(
+            model,
+            device=device,
+            compute_type=compute_type,
+            download_root=str(cache_dir) if cache_dir is not None else None,
+            revision=revision,
+        )
 
     @property
     def wants_wav_segments(self) -> bool:
