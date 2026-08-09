@@ -117,10 +117,45 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
 
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
       # CVE-2025-71176 is pytest's tmpdir handling — a dev-only dependency that
       # never runs in the shipped image. Drop the ignore once pytest 9 lands here.
-      - name: Audit dependencies for vulnerabilities
+      - name: Audit Python dependencies
         run: uv audit --preview --ignore GHSA-6w46-j5rx-g56g
+
+      - name: Audit production frontend dependencies
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high
+
+  supply-chain:
+    name: SBOM & vulnerability report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: voice-ai.spdx.json
+          artifact-name: voice-ai-sbom.spdx.json
+          upload-artifact-retention: 30
+          upload-release-assets: false
+
+      - name: Scan SBOM for critical vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: voice-ai.spdx.json
+          fail-build: true
+          severity-cutoff: critical
+          output-format: table
 
   semgrep:
     name: SAST (Semgrep)
