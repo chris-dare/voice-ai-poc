@@ -68,7 +68,7 @@ jobs:
           version: "0.12.3"
 
       - name: Set up Python
-        run: uv python install 3.12.13
+        run: uv python install 3.13.14
 
       - name: Ruff lint
         run: uvx --from ruff==0.16.0 ruff check --output-format=github .
@@ -81,6 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      UV_PYTHON: "3.13"
     # The suite runs on SQLite by default. The PostgreSQL tests
     # (tests/agent/telco/test_tools_postgres.py, tests/agent/api/) skip unless
     # TEST_DATABASE_URL is set and its name contains "test" — hence voice_ai_test.
@@ -107,7 +108,7 @@ jobs:
           version: "0.12.3"
 
       - name: Set up Python
-        run: uv python install 3.12.13
+        run: uv python install 3.13.14
 
       - name: Install dependencies
         run: uv sync --frozen --all-extras --group dev
@@ -175,7 +176,7 @@ jobs:
           version: "0.12.3"
 
       - name: Set up Python
-        run: uv python install 3.12.13
+        run: uv python install 3.13.14
 
       - name: Set up Node
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -238,7 +239,7 @@ jobs:
           IMAGE: voice-ai-ci:${{ github.sha }}
         run: |
           docker run --rm --entrypoint python "$IMAGE" -c \
-            "import os; from faster_whisper.utils import download_model; from pathlib import Path; from voice_ai.voice.speech.assets import kokoro_assets_valid; p=download_model('base', cache_dir='/app/models/whisper', revision='ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66', local_files_only=True); assert Path(p).is_dir(); assert kokoro_assets_valid(Path('/app/models/kokoro')); assert Path('/app/frontend/dist/index.html').is_file(); assert os.getuid() == 10001; assert not os.access('/app', os.W_OK)"
+            "import os, sys, av, cv2; from faster_whisper.utils import download_model; from pathlib import Path; from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport; from voice_ai.voice.speech.assets import kokoro_assets_valid; p=download_model('base', cache_dir='/app/models/whisper', revision='ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66', local_files_only=True); assert sys.version_info[:2] == (3, 13); assert Path(p).is_dir(); assert kokoro_assets_valid(Path('/app/models/kokoro')); assert Path('/app/frontend/dist/index.html').is_file(); assert os.getuid() == 10001; assert not os.access('/app', os.W_OK); assert SmallWebRTCTransport; assert av.__version__; assert cv2.__version__"
 
       - name: Generate production image SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
