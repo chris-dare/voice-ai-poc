@@ -1,3 +1,6 @@
+import asyncio
+from collections import Counter
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import pytest
@@ -15,6 +18,21 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from voice_ai.agent.protocol import AgentTurnRequest
 from voice_ai.agent.runtime import AgentRuntime, current_datetime
 from voice_ai.shared.config import Settings
+
+
+class RecordingCapacity:
+    def __init__(self) -> None:
+        self.entries: list[tuple[str, str, str]] = []
+        self.releases: list[tuple[str, str, str]] = []
+
+    @asynccontextmanager
+    async def reserve(self, *, resource_kind: str, resource_key: str, owner_id: str):
+        record = (resource_kind, resource_key, owner_id)
+        self.entries.append(record)
+        try:
+            yield
+        finally:
+            self.releases.append(record)
 
 
 def test_current_datetime_supports_iana_timezones() -> None:
@@ -139,6 +157,65 @@ async def test_code_mode_executes_in_monty_and_emits_tool_activity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_and_tool_calls_use_execution_capacity_hooks() -> None:
+    async def model_stream(messages, _info: AgentInfo):
+        if any(isinstance(part, ToolReturnPart) for message in messages for part in message.parts):
+            yield "The answer is 4."
+        else:
+            yield {
+                0: DeltaToolCall(
+                    name="run_code",
+                    json_args='{"code":"2 + 2"}',
+                    tool_call_id="capacity-code",
+                )
+            }
+
+    capacity = RecordingCapacity()
+    runtime = AgentRuntime(
+        Settings(),
+        model=FunctionModel(stream_function=model_stream),
+        execution_capacity=capacity,  # type: ignore[arg-type]
+    )
+    request = AgentTurnRequest(session_id=uuid4(), text="Calculate 2 + 2")
+
+    events = [event async for event in runtime.stream_turn(request)]
+    await runtime.shutdown()
+
+    assert events[-1].type == "response_completed"
+    assert [entry[0] for entry in capacity.entries].count("model") == 2
+    assert any(entry[:2] == ("tool", "run_code") for entry in capacity.entries)
+    assert Counter(capacity.releases) == Counter(capacity.entries)
+
+
+@pytest.mark.asyncio
+async def test_slow_stream_consumer_cancels_without_blocking_on_full_buffer() -> None:
+    async def model_stream(messages, _info: AgentInfo):
+        if any(isinstance(part, ToolReturnPart) for message in messages for part in message.parts):
+            yield "The answer is 4."
+        else:
+            yield {
+                0: DeltaToolCall(
+                    name="run_code",
+                    json_args='{"code":"2 + 2"}',
+                    tool_call_id="bounded-buffer",
+                )
+            }
+
+    runtime = AgentRuntime(
+        Settings(agent_stream_buffer_capacity=1),
+        model=FunctionModel(stream_function=model_stream),
+    )
+    stream = runtime.stream_turn(
+        AgentTurnRequest(session_id=uuid4(), text="Calculate while I disconnect")
+    )
+
+    assert (await anext(stream)).type == "response_started"
+    assert (await anext(stream)).type == "tool_started"
+    await asyncio.wait_for(stream.aclose(), timeout=0.5)
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_code_mode_cannot_read_provider_credentials(monkeypatch) -> None:
     secret = "must-not-enter-the-monty-sandbox"
     monkeypatch.setenv("OPENROUTER_API_KEY", secret)
@@ -223,9 +300,11 @@ async def test_deep_agent_streams_nested_specialist_tool_activity() -> None:
                 )
             }
 
+    capacity = RecordingCapacity()
     runtime = AgentRuntime(
         Settings(),
         model=FunctionModel(stream_function=model_stream),
+        execution_capacity=capacity,  # type: ignore[arg-type]
     )
     events = [
         event
@@ -251,6 +330,11 @@ async def test_deep_agent_streams_nested_specialist_tool_activity() -> None:
         "general_assistant",
     }
     assert events[-1].usage.model_requests == len(events[-1].usage.attempts)
+    # Three root model steps plus two analyst steps must all use the shared
+    # model-route limiter; the nested sandbox call uses the tool limiter too.
+    assert [entry[0] for entry in capacity.entries].count("model") == 5
+    assert any(entry[:2] == ("tool", "run_code") for entry in capacity.entries)
+    assert Counter(capacity.releases) == Counter(capacity.entries)
 
 
 @pytest.mark.asyncio

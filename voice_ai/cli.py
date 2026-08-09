@@ -67,6 +67,7 @@ def worker() -> None:
 
 async def _run_worker() -> None:
     from voice_ai.agent.api.services import AgentApiService
+    from voice_ai.agent.capacity import DistributedExecutionCapacity
     from voice_ai.agent.persistence.database import Database
     from voice_ai.agent.runtime import AgentRuntime
     from voice_ai.shared.observability import configure_observability, instrument_sqlalchemy
@@ -80,7 +81,10 @@ async def _run_worker() -> None:
         pool_timeout=settings.database_pool_timeout_seconds,
     )
     instrument_sqlalchemy(database.engine)
-    runtime = AgentRuntime(settings)
+    runtime = AgentRuntime(
+        settings,
+        execution_capacity=DistributedExecutionCapacity(database, settings),
+    )
     service = AgentApiService(settings, database, runtime)
     try:
         await runtime.startup()

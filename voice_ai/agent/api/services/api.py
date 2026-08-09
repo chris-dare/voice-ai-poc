@@ -17,6 +17,7 @@ from sqlmodel import select
 from voice_ai.agent.api.auth import AuthContext
 from voice_ai.agent.api.models import (
     Conversation,
+    ExecutionCapacityLease,
     IdempotencyRecord,
     ModelAvailability,
     RateLimitBucket,
@@ -43,11 +44,17 @@ from voice_ai.agent.api.services.representations import (
     _owns,
     action_repr,
     conversation_repr,
+    execution_audit_repr,
     request_fingerprint,
     response_repr,
     sse_record,
 )
-from voice_ai.agent.models import model_display_name, probe_model_availability
+from voice_ai.agent.execution_audit import build_execution_snapshot
+from voice_ai.agent.models import (
+    ModelConfigurationError,
+    model_display_name,
+    probe_model_availability,
+)
 from voice_ai.agent.persistence.database import Database
 from voice_ai.agent.protocol import (
     AgentError,
@@ -58,12 +65,16 @@ from voice_ai.agent.protocol import (
     ToolCompleted,
     ToolStarted,
 )
-from voice_ai.agent.runtime import AgentRuntime
+from voice_ai.agent.runtime import SYSTEM_PROMPT, AgentRuntime
 from voice_ai.shared.config import AgentSettings
 from voice_ai.shared.observability import (
+    record_agent_active_responses,
     record_agent_job_event,
     record_agent_queue_depth,
     record_agent_response,
+    record_agent_response_event,
+    record_agent_tool,
+    record_agent_worker_recovery,
 )
 
 ACTIVE_STATUSES = frozenset({"queued", "in_progress", "requires_action"})
@@ -80,7 +91,7 @@ class AgentApiService:
         self.settings = settings
         self.database = database
         self.runtime = runtime
-        self.events = EventBroker()
+        self.events = EventBroker(settings.agent_event_broker_capacity)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._expiry_tasks: dict[str, asyncio.Task[None]] = {}
         self._response_locks: dict[str, asyncio.Lock] = {}
@@ -508,7 +519,33 @@ class AgentApiService:
                     extensions={"retry_after": 2},
                 )
 
+            tenant_active = (
+                await session.exec(
+                    select(func.count(ResponseRecord.id)).where(
+                        ResponseRecord.tenant_id == auth.tenant_id,
+                        ResponseRecord.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+            ).one()
+            if tenant_active >= self.settings.agent_tenant_active_response_limit:
+                raise ApiProblem(
+                    429,
+                    "tenant_capacity_exhausted",
+                    "This tenant has too many active responses; retry shortly.",
+                    extensions={"retry_after": 2},
+                )
+
             now = _now()
+            selection_getter = getattr(self.runtime, "model_selection_for", None)
+            try:
+                selection = selection_getter(model_id) if callable(selection_getter) else None
+            except ModelConfigurationError as exc:
+                raise ApiProblem(
+                    503,
+                    "model_unavailable",
+                    "The requested model route could not be configured.",
+                    extensions={"model": model_id},
+                ) from exc
             response = ResponseRecord(
                 id=_id("resp"),
                 conversation_id=conversation.id if conversation else None,
@@ -530,6 +567,13 @@ class AgentApiService:
                 error_json=None,
                 usage_json=None,
                 metadata_json=request.metadata,
+                execution_snapshot_json=build_execution_snapshot(
+                    self.settings,
+                    agent_id=agent_id,
+                    model_id=model_id,
+                    definition_source=SYSTEM_PROMPT,
+                    selection=selection,
+                ),
                 background=request.background,
                 stream=request.stream,
             )
@@ -580,6 +624,7 @@ class AgentApiService:
                     conversation.metadata_json = metadata
                 conversation.updated_at = now
         await self.events.publish(response.id)
+        record_agent_response_event(event="accepted", status="queued")
         self._work_available.set()
         return response_repr(response), False
 
@@ -590,6 +635,17 @@ class AgentApiService:
             if response is None or not _owns(response, auth):
                 raise ApiProblem(404, "not_found", "Response not found.")
             return response_repr(response)
+
+    async def get_response_execution(
+        self,
+        auth: AuthContext,
+        response_id: str,
+    ) -> dict[str, Any]:
+        async with self.database.session() as session:
+            response = await session.get(ResponseRecord, response_id)
+            if response is None or not _owns(response, auth):
+                raise ApiProblem(404, "not_found", "Response not found.")
+            return execution_audit_repr(response)
 
     async def list_conversation_responses(
         self,
@@ -749,10 +805,7 @@ class AgentApiService:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self._tasks.pop(response_id, None)
-        await self._restore_session_for_response(response)
-        await self.runtime.clear_confirmation(response.runtime_session_id)
-        state = await self.runtime.export_session_state(response.runtime_session_id)
-        await self._save_session_state_for_response(response_id, state)
+        await self._clear_confirmation_for_response(response)
         await self.events.publish(response_id)
         return response_repr(response), False
 
@@ -843,10 +896,7 @@ class AgentApiService:
                     response.id,
                 )
         if expired:
-            await self._restore_session_for_response(response)
-            await self.runtime.clear_confirmation(response.runtime_session_id)
-            state = await self.runtime.export_session_state(response.runtime_session_id)
-            await self._save_session_state_for_response(response_id, state)
+            await self._clear_confirmation_for_response(response)
             await self.events.publish(response_id)
             raise ApiProblem(409, "action_expired", "The required action has expired.")
         expiry = self._expiry_tasks.pop(action_id, None)
@@ -945,6 +995,9 @@ class AgentApiService:
             await session.exec(delete(IdempotencyRecord).where(IdempotencyRecord.expires_at < now))
             await session.exec(delete(RateLimitBucket).where(RateLimitBucket.expires_at < now))
             await session.exec(
+                delete(ExecutionCapacityLease).where(ExecutionCapacityLease.expires_at < now)
+            )
+            await session.exec(
                 delete(WorkerNode).where(
                     WorkerNode.heartbeat_at
                     < now - timedelta(seconds=self.settings.agent_worker_presence_ttl_seconds * 10)
@@ -954,7 +1007,12 @@ class AgentApiService:
     async def _maintenance_loop(self) -> None:
         while True:
             await asyncio.sleep(3_600)
-            await self.prune()
+            try:
+                await self.prune()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Agent maintenance failed; retrying on the next interval")
 
     async def run_worker_forever(self) -> None:
         """Claim durable jobs up to the configured per-process concurrency."""
@@ -979,13 +1037,19 @@ class AgentApiService:
                     claimed = await self._claim_response_job()
                     if claimed is None:
                         break
-                    response_id, decision = claimed
+                    response_id, decision, recovered = claimed
                     claimed_any = True
                     task = asyncio.create_task(
-                        self._execute_claimed_job(response_id, decision),
+                        self._execute_claimed_job(response_id, decision, recovered=recovered),
                         name=f"agent-response-{response_id}",
                     )
                     self._tasks[response_id] = task
+                    task.add_done_callback(
+                        lambda finished, claimed_id=response_id: self._response_task_finished(
+                            claimed_id,
+                            finished,
+                        )
+                    )
                 if claimed_any:
                     await asyncio.sleep(0)
                     continue
@@ -1001,6 +1065,24 @@ class AgentApiService:
             presence.cancel()
             await asyncio.gather(presence, return_exceptions=True)
             await self._record_worker_presence("stopped")
+
+    def _response_task_finished(
+        self,
+        response_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        if self._tasks.get(response_id) is task:
+            self._tasks.pop(response_id, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            record_agent_job_event(event="task_failed", attempt=0)
+            logger.opt(exception=error).error(
+                "Agent response task failed; durable lease recovery remains authoritative "
+                "response_id={}",
+                response_id,
+            )
 
     async def _worker_presence_loop(self) -> None:
         while True:
@@ -1044,8 +1126,16 @@ class AgentApiService:
                     )
                 )
             ).one()
+            active_responses = (
+                await session.exec(
+                    select(func.count(ResponseRecord.id)).where(
+                        ResponseRecord.status.in_(ACTIVE_STATUSES)
+                    )
+                )
+            ).one()
         workers, concurrency = active
         record_agent_queue_depth(int(queued or 0))
+        record_agent_active_responses(int(active_responses or 0))
         return {
             "ready": bool(workers),
             "workers": int(workers or 0),
@@ -1053,7 +1143,7 @@ class AgentApiService:
             "queued": int(queued or 0),
         }
 
-    async def _claim_response_job(self) -> tuple[str, str | None] | None:
+    async def _claim_response_job(self) -> tuple[str, str | None, bool] | None:
         now = _now()
         async with self.database.session_factory.begin() as session:
             statement = (
@@ -1082,6 +1172,7 @@ class AgentApiService:
                 job.status = "completed"
                 job.updated_at = now
                 return None
+            recovered_lease = job.lease_expires_at if job.status == "running" else None
             job.status = "running"
             job.attempt_count += 1
             job.lease_owner = self._worker_id
@@ -1092,9 +1183,35 @@ class AgentApiService:
                 event="claimed",
                 attempt=job.attempt_count,
             )
-            return job.response_id, job.decision
+            if recovered_lease is not None:
+                record_agent_job_event(event="recovered", attempt=job.attempt_count)
+                record_agent_worker_recovery(
+                    delay_ms=max(
+                        0.0,
+                        (now - _as_utc(recovered_lease)).total_seconds() * 1_000,
+                    ),
+                    attempt=job.attempt_count,
+                )
+            return job.response_id, job.decision, recovered_lease is not None
 
-    async def _execute_claimed_job(self, response_id: str, decision: str | None) -> None:
+    async def _execute_claimed_job(
+        self,
+        response_id: str,
+        decision: str | None,
+        *,
+        recovered: bool = False,
+    ) -> None:
+        if recovered and await self._has_non_replayable_progress(response_id):
+            await self._fail_response(
+                response_id,
+                code="execution_interrupted",
+                message=(
+                    "The worker stopped after publishing model or tool progress. "
+                    "Retry the request to avoid replaying completed work automatically."
+                ),
+                retryable=True,
+            )
+            return
         execution_task = asyncio.current_task()
         assert execution_task is not None
         heartbeat = asyncio.create_task(
@@ -1122,6 +1239,24 @@ class AgentApiService:
             await asyncio.gather(heartbeat, return_exceptions=True)
         await self._finalize_response_job(response_id)
 
+    async def _has_non_replayable_progress(self, response_id: str) -> bool:
+        async with self.database.session() as session:
+            event = (
+                await session.exec(
+                    select(ResponseEvent.sequence_number).where(
+                        ResponseEvent.response_id == response_id,
+                        ResponseEvent.type.in_(
+                            {
+                                "response.output_text.delta",
+                                "response.tool.started",
+                                "response.tool.completed",
+                            }
+                        ),
+                    )
+                )
+            ).first()
+        return event is not None
+
     async def _heartbeat_job(
         self,
         response_id: str,
@@ -1138,21 +1273,43 @@ class AgentApiService:
         last_heartbeat = perf_counter()
         while True:
             await asyncio.sleep(interval)
-            now = _now()
-            async with self.database.session_factory.begin() as session:
-                job = await session.get(ResponseJob, response_id, with_for_update=True)
-                if job is not None and job.status == "cancelled":
+            try:
+                now = _now()
+                async with self.database.session_factory.begin() as session:
+                    job = await session.get(ResponseJob, response_id, with_for_update=True)
+                    if job is not None and job.status == "cancelled":
+                        execution_task.cancel()
+                        return
+                    if job is None or job.status != "running" or job.lease_owner != self._worker_id:
+                        logger.warning(
+                            "Agent response lease was lost; cancelling local execution "
+                            "response_id={}",
+                            response_id,
+                        )
+                        record_agent_job_event(
+                            event="lease_lost",
+                            attempt=job.attempt_count if job else 0,
+                        )
+                        execution_task.cancel()
+                        return
+                    if perf_counter() - last_heartbeat >= heartbeat_interval:
+                        job.heartbeat_at = now
+                        job.lease_expires_at = now + timedelta(
+                            seconds=self.settings.agent_job_lease_seconds
+                        )
+                        job.updated_at = now
+                        last_heartbeat = perf_counter()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Agent response heartbeat failed; cancelling local execution response_id={}",
+                    response_id,
+                )
+                record_agent_job_event(event="heartbeat_failed", attempt=0)
+                if not execution_task.done():
                     execution_task.cancel()
-                    return
-                if job is None or job.status != "running" or job.lease_owner != self._worker_id:
-                    return
-                if perf_counter() - last_heartbeat >= heartbeat_interval:
-                    job.heartbeat_at = now
-                    job.lease_expires_at = now + timedelta(
-                        seconds=self.settings.agent_job_lease_seconds
-                    )
-                    job.updated_at = now
-                    last_heartbeat = perf_counter()
+                return
 
     async def _finalize_response_job(self, response_id: str) -> None:
         async with self.database.session_factory.begin() as session:
@@ -1210,200 +1367,252 @@ class AgentApiService:
 
     async def _run_response(self, response_id: str, *, decision: str | None) -> None:
         lock = self._response_locks.setdefault(response_id, asyncio.Lock())
-        async with lock:
-            try:
-                response, session_state = await self._mark_in_progress(response_id)
-                execution_started = perf_counter()
-                await self.runtime.restore_session_state(response.runtime_session_id, session_state)
-                text = (
-                    "yes please"
-                    if decision == "approve"
-                    else "no"
-                    if decision == "reject"
-                    else _input_text(response.input_json)
-                )
-                output_text = ""
-                request = AgentTurnRequest(
-                    session_id=response.runtime_session_id,
-                    text=text,
-                    model_id=response.model_id,
-                )
-                tool_runs: dict[str, list[str]] = {}
-                tool_activity: list[dict[str, Any]] = []
-                turn_completed = False
-                turn_usage: dict[str, Any] | None = None
-                time_to_first_text_ms: float | None = None
-                output_item_id = (
-                    f"msg_{response_id.removeprefix('resp_')}{'_resume' if decision else ''}"
-                )
-                async for event in self.runtime.stream_turn(request):
-                    if isinstance(event, ResponseStarted):
-                        continue
-                    if isinstance(event, ToolStarted):
-                        tool_run_id = _id("toolrun")
-                        correlation_key = event.tool_call_id or (
-                            f"{event.source}:{event.agent or 'root'}:{event.tool}"
-                        )
-                        tool_runs.setdefault(correlation_key, []).append(tool_run_id)
-                        display_label = (
-                            f"{event.label} · {event.agent}"
-                            if event.source == "subagent" and event.agent
-                            else event.label
-                        )
-                        activity_item = {
-                            "id": tool_run_id,
-                            "type": "tool_activity",
-                            "name": event.tool,
-                            "label": display_label,
-                            "status": "running",
-                        }
-                        if event.source == "subagent":
-                            activity_item.update({"source": event.source, "agent": event.agent})
-                        tool_activity.append(activity_item)
-                        await self._append_event(
-                            response_id,
-                            "response.tool.started",
-                            tool_run_id=tool_run_id,
-                            name=event.tool,
-                            label=display_label,
-                            source=event.source,
-                            agent=event.agent,
-                        )
-                    elif isinstance(event, ToolCompleted):
-                        correlation_key = event.tool_call_id or (
-                            f"{event.source}:{event.agent or 'root'}:{event.tool}"
-                        )
-                        pending_runs = tool_runs.get(correlation_key) or []
-                        tool_run_id = pending_runs.pop(0) if pending_runs else _id("toolrun")
-                        display_label = (
-                            f"{event.label} · {event.agent}"
-                            if event.source == "subagent" and event.agent
-                            else event.label
-                        )
-                        activity = next(
-                            (item for item in reversed(tool_activity) if item["id"] == tool_run_id),
-                            None,
-                        )
-                        if activity is None:
-                            activity = {
+        runtime_session_id = None
+        tool_timings: dict[str, tuple[float, str, str]] = {}
+        try:
+            async with lock:
+                try:
+                    response, session_state = await self._mark_in_progress(response_id)
+                    runtime_session_id = response.runtime_session_id
+                    execution_started = perf_counter()
+                    await self.runtime.restore_session_state(
+                        response.runtime_session_id, session_state
+                    )
+                    text = (
+                        "yes please"
+                        if decision == "approve"
+                        else "no"
+                        if decision == "reject"
+                        else _input_text(response.input_json)
+                    )
+                    output_text = ""
+                    request = AgentTurnRequest(
+                        session_id=response.runtime_session_id,
+                        text=text,
+                        model_id=response.model_id,
+                    )
+                    tool_runs: dict[str, list[str]] = {}
+                    tool_activity: list[dict[str, Any]] = []
+                    turn_completed = False
+                    turn_usage: dict[str, Any] | None = None
+                    time_to_first_text_ms: float | None = None
+                    output_size_bytes = 0
+                    output_item_id = (
+                        f"msg_{response_id.removeprefix('resp_')}{'_resume' if decision else ''}"
+                    )
+                    async for event in self.runtime.stream_turn(request):
+                        if isinstance(event, ResponseStarted):
+                            continue
+                        if isinstance(event, ToolStarted):
+                            tool_run_id = _id("toolrun")
+                            correlation_key = event.tool_call_id or (
+                                f"{event.source}:{event.agent or 'root'}:{event.tool}"
+                            )
+                            tool_runs.setdefault(correlation_key, []).append(tool_run_id)
+                            tool_timings[tool_run_id] = (
+                                perf_counter(),
+                                event.tool,
+                                event.source,
+                            )
+                            display_label = (
+                                f"{event.label} · {event.agent}"
+                                if event.source == "subagent" and event.agent
+                                else event.label
+                            )
+                            activity_item = {
                                 "id": tool_run_id,
                                 "type": "tool_activity",
                                 "name": event.tool,
                                 "label": display_label,
+                                "status": "running",
                             }
                             if event.source == "subagent":
-                                activity.update({"source": event.source, "agent": event.agent})
-                            tool_activity.append(activity)
-                        activity["status"] = "succeeded"
-                        if event.detail not in {"Completed", "Tool completed"}:
-                            activity["detail"] = event.detail
-                        await self._append_event(
-                            response_id,
-                            "response.tool.completed",
-                            tool_run_id=tool_run_id,
-                            name=event.tool,
-                            status="succeeded",
-                            label=display_label,
-                            detail=event.detail,
-                            source=event.source,
-                            agent=event.agent,
-                        )
-                    elif isinstance(event, TextDelta):
-                        if time_to_first_text_ms is None:
-                            time_to_first_text_ms = round(
-                                (perf_counter() - execution_started) * 1_000, 1
+                                activity_item.update({"source": event.source, "agent": event.agent})
+                            tool_activity.append(activity_item)
+                            await self._append_event(
+                                response_id,
+                                "response.tool.started",
+                                tool_run_id=tool_run_id,
+                                name=event.tool,
+                                label=display_label,
+                                source=event.source,
+                                agent=event.agent,
                             )
-                        delta = event.text
-                        output_text += delta
-                        await self._append_event(
-                            response_id,
-                            "response.output_text.delta",
-                            item_id=output_item_id,
-                            content_index=0,
-                            delta=delta,
-                        )
-                    elif isinstance(event, AgentError):
-                        if event.model_id and event.model_status in {
-                            "degraded",
-                            "unavailable",
-                        }:
+                        elif isinstance(event, ToolCompleted):
+                            correlation_key = event.tool_call_id or (
+                                f"{event.source}:{event.agent or 'root'}:{event.tool}"
+                            )
+                            pending_runs = tool_runs.get(correlation_key) or []
+                            tool_run_id = pending_runs.pop(0) if pending_runs else _id("toolrun")
+                            display_label = (
+                                f"{event.label} · {event.agent}"
+                                if event.source == "subagent" and event.agent
+                                else event.label
+                            )
+                            activity = next(
+                                (
+                                    item
+                                    for item in reversed(tool_activity)
+                                    if item["id"] == tool_run_id
+                                ),
+                                None,
+                            )
+                            if activity is None:
+                                activity = {
+                                    "id": tool_run_id,
+                                    "type": "tool_activity",
+                                    "name": event.tool,
+                                    "label": display_label,
+                                }
+                                if event.source == "subagent":
+                                    activity.update({"source": event.source, "agent": event.agent})
+                                tool_activity.append(activity)
+                            activity["status"] = "succeeded"
+                            timing = tool_timings.pop(tool_run_id, None)
+                            if timing is not None:
+                                tool_started, tool_name, tool_source = timing
+                                record_agent_tool(
+                                    duration_ms=round(
+                                        (perf_counter() - tool_started) * 1_000,
+                                        1,
+                                    ),
+                                    tool=tool_name,
+                                    source=tool_source,
+                                    status="succeeded",
+                                )
+                            if event.detail not in {"Completed", "Tool completed"}:
+                                activity["detail"] = event.detail
+                            await self._append_event(
+                                response_id,
+                                "response.tool.completed",
+                                tool_run_id=tool_run_id,
+                                name=event.tool,
+                                status="succeeded",
+                                label=display_label,
+                                detail=event.detail,
+                                source=event.source,
+                                agent=event.agent,
+                            )
+                        elif isinstance(event, TextDelta):
+                            if time_to_first_text_ms is None:
+                                time_to_first_text_ms = round(
+                                    (perf_counter() - execution_started) * 1_000, 1
+                                )
+                            delta = event.text
+                            output_size_bytes += len(delta.encode("utf-8"))
+                            if output_size_bytes > self.settings.agent_max_output_bytes:
+                                await self._fail_response(
+                                    response_id,
+                                    code="output_limit_exceeded",
+                                    message="The response exceeded its maximum output size.",
+                                    retryable=False,
+                                    time_to_first_text_ms=time_to_first_text_ms,
+                                )
+                                return
+                            output_text += delta
+                            await self._append_event(
+                                response_id,
+                                "response.output_text.delta",
+                                item_id=output_item_id,
+                                content_index=0,
+                                delta=delta,
+                            )
+                        elif isinstance(event, AgentError):
+                            if event.model_id and event.model_status in {
+                                "degraded",
+                                "unavailable",
+                            }:
+                                await self._record_model_availability(
+                                    event.model_id,
+                                    status=event.model_status,
+                                    reason_code=event.code,
+                                    detail=event.message,
+                                )
+                            await self._fail_response(
+                                response_id,
+                                code=event.code,
+                                message=event.message,
+                                retryable=event.retryable,
+                                usage=(
+                                    event.usage.model_dump(mode="json")
+                                    if event.usage is not None
+                                    else None
+                                ),
+                                time_to_first_text_ms=time_to_first_text_ms,
+                            )
+                            return
+                        elif isinstance(event, ResponseCompleted):
                             await self._record_model_availability(
-                                event.model_id,
-                                status=event.model_status,
-                                reason_code=event.code,
-                                detail=event.message,
+                                response.model_id,
+                                status="available",
+                                reason_code=None,
+                                detail="A recent request completed successfully",
                             )
-                        await self._fail_response(
-                            response_id,
-                            code=event.code,
-                            message=event.message,
-                            retryable=event.retryable,
-                            usage=(
+                            turn_completed = True
+                            turn_usage = (
                                 event.usage.model_dump(mode="json")
                                 if event.usage is not None
                                 else None
-                            ),
-                            time_to_first_text_ms=time_to_first_text_ms,
+                            )
+                    # AgentRuntime serializes each turn with its session lock. Read
+                    # confirmation/history only after the generator has exited and
+                    # released that lock; re-entering from inside TextDelta handling
+                    # deadlocks a real runtime even though simple test doubles allow it.
+                    if not turn_completed:
+                        await self._fail_response(
+                            response_id,
+                            code="agent_execution_failed",
+                            message="The agent stream ended without completing the response.",
+                            retryable=True,
                         )
                         return
-                    elif isinstance(event, ResponseCompleted):
-                        await self._record_model_availability(
-                            response.model_id,
-                            status="available",
-                            reason_code=None,
-                            detail="A recent request completed successfully",
+                    pending = await self.runtime.pending_confirmation(response.runtime_session_id)
+                    state = await self.runtime.export_session_state(response.runtime_session_id)
+                    if pending and decision is None:
+                        await self._require_action(
+                            response_id,
+                            response,
+                            output_text,
+                            output_item_id,
+                            pending,
+                            state,
+                            tool_activity,
+                            turn_usage,
+                            time_to_first_text_ms,
                         )
-                        turn_completed = True
-                        turn_usage = (
-                            event.usage.model_dump(mode="json") if event.usage is not None else None
+                    else:
+                        await self._complete_response(
+                            response_id,
+                            output_text,
+                            output_item_id,
+                            state,
+                            tool_activity,
+                            turn_usage,
+                            time_to_first_text_ms,
                         )
-                # AgentRuntime serializes each turn with its session lock. Read
-                # confirmation/history only after the generator has exited and
-                # released that lock; re-entering from inside TextDelta handling
-                # deadlocks a real runtime even though simple test doubles allow it.
-                if not turn_completed:
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("API response {} execution failed", response_id)
                     await self._fail_response(
                         response_id,
                         code="agent_execution_failed",
-                        message="The agent stream ended without completing the response.",
+                        message="The agent could not complete that request.",
                         retryable=True,
                     )
-                    return
-                pending = await self.runtime.pending_confirmation(response.runtime_session_id)
-                state = await self.runtime.export_session_state(response.runtime_session_id)
-                if pending and decision is None:
-                    await self._require_action(
-                        response_id,
-                        response,
-                        output_text,
-                        output_item_id,
-                        pending,
-                        state,
-                        tool_activity,
-                        turn_usage,
-                        time_to_first_text_ms,
-                    )
-                else:
-                    await self._complete_response(
-                        response_id,
-                        output_text,
-                        output_item_id,
-                        state,
-                        tool_activity,
-                        turn_usage,
-                        time_to_first_text_ms,
-                    )
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("API response {} execution failed", response_id)
-                await self._fail_response(
-                    response_id,
-                    code="agent_execution_failed",
-                    message="The agent could not complete that request.",
-                    retryable=True,
+        finally:
+            for tool_started, tool_name, tool_source in tool_timings.values():
+                record_agent_tool(
+                    duration_ms=round((perf_counter() - tool_started) * 1_000, 1),
+                    tool=tool_name,
+                    source=tool_source,
+                    status="interrupted",
                 )
+            if runtime_session_id is not None:
+                await self.runtime.close_session(runtime_session_id)
+            if self._response_locks.get(response_id) is lock:
+                self._response_locks.pop(response_id, None)
 
     async def _mark_in_progress(self, response_id: str) -> tuple[ResponseRecord, dict[str, Any]]:
         async with self.database.session_factory.begin() as session:
@@ -1617,6 +1826,16 @@ class AgentApiService:
         response.completed_at = now
         response.cancellation_reason = reason
         response.required_action_json = None
+        previous_usage = response.usage_json or {}
+        previous_latency = previous_usage.get("latency", {})
+        response.usage_json = _finalize_usage(
+            response,
+            previous_usage,
+            now=now,
+            time_to_first_text_ms=previous_latency.get("time_to_first_text_ms"),
+            settings=self.settings,
+            status="cancelled",
+        )
         await self._append_event_in_session(
             session,
             response,
@@ -1681,6 +1900,15 @@ class AgentApiService:
             state = conversation.session_state if conversation else response.session_state
         await self.runtime.restore_session_state(response.runtime_session_id, state)
 
+    async def _clear_confirmation_for_response(self, response: ResponseRecord) -> None:
+        try:
+            await self._restore_session_for_response(response)
+            await self.runtime.clear_confirmation(response.runtime_session_id)
+            state = await self.runtime.export_session_state(response.runtime_session_id)
+            await self._save_session_state_for_response(response.id, state)
+        finally:
+            await self.runtime.close_session(response.runtime_session_id)
+
     async def _schedule_expiry(
         self, action_id: str, response_id: str, expires_at: datetime
     ) -> None:
@@ -1712,10 +1940,7 @@ class AgentApiService:
             action.decision = "expired"
             action.decided_at = _now()
             await self._set_cancelled(session, response, "action_expired")
-        await self._restore_session_for_response(response)
-        await self.runtime.clear_confirmation(response.runtime_session_id)
-        state = await self.runtime.export_session_state(response.runtime_session_id)
-        await self._save_session_state_for_response(response_id, state)
+        await self._clear_confirmation_for_response(response)
         await self.events.publish(response_id)
 
     async def _expire_if_needed(self, response_id: str) -> None:
@@ -1877,4 +2102,5 @@ def _finalize_usage(
         completion_ms=completion_ms,
         status=status,
     )
+    record_agent_response_event(event="terminal", status=status)
     return result

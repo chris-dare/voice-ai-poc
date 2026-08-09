@@ -566,7 +566,21 @@ Authorization: Bearer <access-token>
 Returns the latest durable response representation. Clients SHOULD use this
 endpoint to recover after a dropped stream.
 
-### 4.8 List conversation responses
+### 4.8 Retrieve a response execution audit
+
+```http
+GET /v1/responses/{response_id}/execution
+Authorization: Bearer <access-token>
+```
+
+Returns the immutable, credential-free execution snapshot accepted with the response together
+with its observed model attempts. The projection includes the agent-definition version,
+capability set, selected and fallback model routes, effective model settings, server-enforced
+limits, policy version, actual models, and a fallback reason when the provider reports one. It
+requires `responses:read` and is subject to the same tenant and subject ownership check as the
+response itself.
+
+### 4.9 List conversation responses
 
 ```http
 GET /v1/conversations/{conversation_id}/responses?limit=100&after=<cursor>
@@ -578,7 +592,7 @@ can reconstruct the transcript from each response's `input` and `output`. The
 default and maximum `limit` are 100. This endpoint requires both
 `conversations:read` and `responses:read`.
 
-### 4.9 Observe or resume response events
+### 4.10 Observe or resume response events
 
 ```http
 GET /v1/responses/{response_id}/events
@@ -601,7 +615,7 @@ terminal. If the requested cursor is invalid or no longer retained, return `409
 Conflict` with error code `event_cursor_expired`. The client then retrieves the
 durable result with `GET /v1/responses/{id}`.
 
-### 4.10 Cancel a response
+### 4.11 Cancel a response
 
 ```http
 POST /v1/responses/{response_id}/cancel
@@ -620,7 +634,7 @@ Disconnecting a background stream does not cancel its response. Clients that
 require background cancellation MUST call this endpoint. A disconnected
 non-background request is cancelled on a best-effort basis.
 
-### 4.11 Submit a required action
+### 4.12 Submit a required action
 
 When a response requires explicit approval, it has status `requires_action`:
 

@@ -4,7 +4,7 @@ import hmac
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from time import perf_counter
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -15,6 +15,8 @@ from loguru import logger
 from voice_ai.agent.api.auth import AccessTokenVerifier, Auth0AccessTokenVerifier
 from voice_ai.agent.api.router import create_api_router
 from voice_ai.agent.api.services import AgentApiService, ApiProblem
+from voice_ai.agent.capacity import DistributedExecutionCapacity
+from voice_ai.agent.execution_audit import enabled_capabilities, execution_limits
 from voice_ai.agent.persistence.database import Database
 from voice_ai.agent.protocol import AgentTurnRequest
 from voice_ai.agent.runtime import AgentRuntime
@@ -26,6 +28,22 @@ from voice_ai.shared.observability import (
     record_startup_latency,
 )
 from voice_ai.shared.startup import PROCESS_STARTED_AT
+
+
+def capability_manifest(settings: AgentSettings) -> dict[str, Any]:
+    """Build the operator manifest from effective runtime configuration."""
+    optional_features = ["durable_response_dispatch"]
+    optional_features.extend(
+        capability
+        for capability in enabled_capabilities(settings)
+        if capability != "general_assistance"
+    )
+    return {
+        "spec_version": "0.1",
+        "profiles": ["core"],
+        "optional_features": optional_features,
+        "limits": execution_limits(settings),
+    }
 
 
 def create_agent_app(
@@ -42,7 +60,10 @@ def create_agent_app(
         pool_timeout=configured.database_pool_timeout_seconds,
     )
     instrument_sqlalchemy(database.engine)
-    runtime = AgentRuntime(configured)
+    runtime = AgentRuntime(
+        configured,
+        execution_capacity=DistributedExecutionCapacity(database, configured),
+    )
     api_service = AgentApiService(configured, database, runtime)
     verifier = token_verifier
     if verifier is None and configured.api_enabled and not configured.api_auth_errors():
@@ -215,6 +236,14 @@ def create_agent_app(
     async def livez() -> dict[str, str]:
         return {"status": "alive"}
 
+    @app.get(
+        "/capabilities",
+        dependencies=[Depends(authorize)],
+        include_in_schema=False,
+    )
+    async def capabilities() -> dict[str, Any]:
+        return capability_manifest(configured)
+
     @app.get("/readyz", include_in_schema=False)
     async def readyz() -> JSONResponse:
         model_status = await runtime.model_readiness()
@@ -231,7 +260,8 @@ def create_agent_app(
             worker_status = await api_service.worker_readiness()
         except Exception:
             logger.debug("Agent database readiness check failed", exc_info=True)
-        ready = bool(model_status["ready"]) and database_ready
+        workers_ready = not configured.api_enabled or bool(worker_status["ready"])
+        ready = bool(model_status["ready"]) and database_ready and workers_ready
         auth_ready = not configured.api_enabled or verifier is not None
         production_errors = configured.production_errors()
         ready = ready and auth_ready and not production_errors

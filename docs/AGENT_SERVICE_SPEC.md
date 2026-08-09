@@ -774,10 +774,11 @@ As of 2026-08-03, the current project implements the Core profile foundation:
 - implemented foundation: per-response and per-model-attempt usage, estimated cost where pricing is
   known, interactive latency objectives, a versioned deterministic/live evaluation gate,
   PostgreSQL-backed bounded dispatch, leased worker ownership, heartbeats, retry exhaustion,
-  shared rate limits, and cross-replica durable event visibility;
-- partial: representative eval coverage and calibration, machine-readable capability manifest,
-  comprehensive policy enforcement, deletion propagation evidence, and checkpoint recovery inside
-  a model/tool turn;
+  shared rate limits, fleet-wide leased model/tool capacity, cross-replica durable event
+  visibility, immutable response execution snapshots with an owner-scoped audit projection, and a
+  machine-readable capability manifest generated from effective configuration;
+- partial: representative eval coverage and calibration, comprehensive policy enforcement,
+  deletion propagation evidence, and checkpoint recovery inside a model/tool turn;
 - not claimed: Effectful Tools, Durable Workflows, or Managed Platform conformance. Required-action
   API scaffolding alone is not Effectful Tools conformance, and persisted response state alone is
   not Durable Workflows conformance.

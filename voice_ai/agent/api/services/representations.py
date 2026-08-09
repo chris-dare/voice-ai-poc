@@ -65,6 +65,48 @@ def response_repr(response: ResponseRecord) -> dict[str, Any]:
     }
 
 
+def execution_audit_repr(response: ResponseRecord) -> dict[str, Any]:
+    """Return the safe execution projection without exposing prompts or credentials."""
+    usage = response.usage_json or {}
+    attempts = usage.get("attempts")
+    attempt_records = attempts if isinstance(attempts, list) else []
+    failed_attempts = [
+        attempt
+        for attempt in attempt_records
+        if isinstance(attempt, dict) and attempt.get("status") == "failed"
+    ]
+    actual_models = usage.get("actual_models")
+    actual_model_ids = actual_models if isinstance(actual_models, list) else []
+    fallback_ids = response.execution_snapshot_json.get("model_route", {}).get(
+        "fallback_model_ids", []
+    )
+    fallback_used = any(
+        _unqualified_model_id(actual) == _unqualified_model_id(configured)
+        for actual in actual_model_ids
+        for configured in fallback_ids
+        if isinstance(actual, str) and isinstance(configured, str)
+    )
+    return {
+        "id": response.id,
+        "object": "response.execution",
+        "status": response.status,
+        **response.execution_snapshot_json,
+        "model_execution": {
+            "attempt_count": len(attempt_records),
+            "attempts": attempt_records,
+            "actual_model_ids": actual_model_ids,
+            "fallback_used": fallback_used,
+            "fallback_reason": (
+                failed_attempts[0].get("error_type") if fallback_used and failed_attempts else None
+            ),
+        },
+    }
+
+
+def _unqualified_model_id(value: str) -> str:
+    return value.split(":", 1)[-1]
+
+
 def action_repr(action: RequiredAction) -> dict[str, Any]:
     return {
         "id": action.id,

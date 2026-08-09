@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, suppress
@@ -21,6 +22,7 @@ from pydantic_ai import (
     UsageLimits,
 )
 from pydantic_ai.capabilities import CombinedCapability, Thinking, WebFetch, WebSearch
+from pydantic_ai.capabilities.hooks import Hooks
 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 from pydantic_ai.common_tools.web_fetch import web_fetch_tool
 from pydantic_ai.mcp import load_mcp_toolsets
@@ -41,8 +43,10 @@ from pydantic_ai_harness.compaction import LimitWarner, SlidingWindow
 from pydantic_ai_harness.planning import Planning
 from pydantic_ai_harness.subagents import SubAgent, SubAgents
 
+from voice_ai.agent.capacity import DistributedExecutionCapacity, ExecutionCapacityError
 from voice_ai.agent.models import (
     ModelConfigurationError,
+    ModelFailure,
     ModelSelection,
     check_model_readiness,
     classify_model_failure,
@@ -94,6 +98,7 @@ class AgentDependencies:
 
     event_sink: EventSink | None = None
     usage: UsageTracker | None = None
+    execution_id: str = "unknown"
 
 
 @dataclass(slots=True)
@@ -110,8 +115,10 @@ class AgentRuntime:
         settings: AgentSettings,
         *,
         model: Model | None = None,
+        execution_capacity: DistributedExecutionCapacity | None = None,
     ) -> None:
         self.settings = settings
+        self.execution_capacity = execution_capacity
         self._injected_model = model is not None
         self._sessions: dict[UUID, AgentSession] = {}
         self._sessions_lock = asyncio.Lock()
@@ -169,6 +176,8 @@ class AgentRuntime:
             CodeMode(tools=_use_code_mode, dynamic_catalog=True),
             _web_capability(defer_loading=True, research=False),
         ]
+        if execution_capacity is not None:
+            capabilities.append(_execution_capacity_hooks(execution_capacity))
         if settings.agent_deep_agents_enabled:
             if settings.agent_planning_enabled:
                 capabilities.append(
@@ -246,6 +255,11 @@ class AgentRuntime:
             ),
             capabilities=[
                 model_usage_hooks(),
+                *(
+                    [_execution_capacity_hooks(self.execution_capacity)]
+                    if self.execution_capacity is not None
+                    else []
+                ),
                 _thinking(self.settings.agent_deep_thinking_effort),
                 _web_capability(defer_loading=False, research=True),
                 SlidingWindow(max_tokens=20_000, keep_tokens=15_000),
@@ -268,6 +282,11 @@ class AgentRuntime:
             tools=[current_datetime],
             capabilities=[
                 model_usage_hooks(),
+                *(
+                    [_execution_capacity_hooks(self.execution_capacity)]
+                    if self.execution_capacity is not None
+                    else []
+                ),
                 _thinking(self.settings.agent_deep_thinking_effort),
                 CodeMode(tools=_use_code_mode, dynamic_catalog=True),
                 SlidingWindow(max_tokens=16_000, keep_tokens=12_000),
@@ -289,6 +308,11 @@ class AgentRuntime:
             ),
             capabilities=[
                 model_usage_hooks(),
+                *(
+                    [_execution_capacity_hooks(self.execution_capacity)]
+                    if self.execution_capacity is not None
+                    else []
+                ),
                 _thinking(self.settings.agent_deep_thinking_effort),
             ],
             model_settings=shared_settings,
@@ -390,7 +414,9 @@ class AgentRuntime:
         session = await self._session(request.session_id)
 
         async with session.lock:
-            queue: asyncio.Queue[AgentEvent | object] = asyncio.Queue()
+            queue: asyncio.Queue[AgentEvent | object] = asyncio.Queue(
+                maxsize=self.settings.agent_stream_buffer_capacity
+            )
             producer = asyncio.create_task(
                 self._produce_turn(request, session, queue, started),
                 name=f"agent-turn-{request.turn_id}",
@@ -417,6 +443,7 @@ class AgentRuntime:
     ) -> None:
         route = "model"
         selection = self.model_selection
+        cancelled = False
         try:
             selection = self.model_selection_for(request.model_id)
             if selection.configuration_errors:
@@ -424,7 +451,11 @@ class AgentRuntime:
             if not self._started:
                 await self.startup()
             usage_tracker = UsageTracker()
-            deps = AgentDependencies(event_sink=queue.put, usage=usage_tracker)
+            deps = AgentDependencies(
+                event_sink=queue.put,
+                usage=usage_tracker,
+                execution_id=str(request.turn_id),
+            )
             emitted_tools: set[str] = set()
             observed_tool_calls = 0
             final_text = ""
@@ -502,9 +533,14 @@ class AgentRuntime:
                 )
             )
         except asyncio.CancelledError:
+            cancelled = True
             raise
         except Exception as exc:
-            failure = classify_model_failure(exc, selection.primary_id)
+            failure = (
+                _capacity_failure(exc, selection.primary_id)
+                if isinstance(exc, ExecutionCapacityError)
+                else classify_model_failure(exc, selection.primary_id)
+            )
             latency_ms = round((perf_counter() - started) * 1_000, 1)
             tracker = locals().get("usage_tracker")
             usage_summary = (
@@ -544,7 +580,13 @@ class AgentRuntime:
                 )
             )
         finally:
-            await queue.put(_STREAM_FINISHED)
+            if cancelled:
+                # The consumer has gone away, so never block cancellation on a
+                # full bounded queue that nobody will drain.
+                with suppress(asyncio.QueueFull):
+                    queue.put_nowait(_STREAM_FINISHED)
+            else:
+                await queue.put(_STREAM_FINISHED)
 
     async def _stream_subagent_events(
         self,
@@ -734,6 +776,56 @@ def _web_capability(
         ),
         defer_loading=defer_loading,
     )
+
+
+def _execution_capacity_hooks(capacity: DistributedExecutionCapacity) -> Hooks[AgentDependencies]:
+    hooks: Hooks[AgentDependencies] = Hooks()
+
+    @hooks.on.model_request
+    async def bound_model_request(ctx, *, request_context, handler):
+        model = request_context.model
+        route = _capacity_key(f"{model.system}:{model.model_name}")
+        async with capacity.reserve(
+            resource_kind="model",
+            resource_key=route,
+            owner_id=f"{ctx.deps.execution_id}:model:{ctx.run_step}",
+        ):
+            return await handler(request_context)
+
+    @hooks.on.tool_execute
+    async def bound_tool_execution(ctx, *, call, tool_def, args, handler):
+        async with capacity.reserve(
+            resource_kind="tool",
+            resource_key=_capacity_key(call.tool_name),
+            owner_id=f"{ctx.deps.execution_id}:tool:{call.tool_call_id}",
+        ):
+            return await handler(args)
+
+    return hooks
+
+
+def _capacity_failure(error: ExecutionCapacityError, model_id: str) -> ModelFailure:
+    return ModelFailure(
+        code=error.code,
+        message=(
+            "The selected model route is busy; try again shortly."
+            if error.resource_kind == "model"
+            else "A required tool is busy; try again shortly."
+        ),
+        status="degraded",
+        retryable=True,
+        detail=(
+            f"Capacity wait expired for {error.resource_kind} resource "
+            f"{error.resource_key} while using {model_id}"
+        ),
+    )
+
+
+def _capacity_key(value: str) -> str:
+    if len(value) <= 255:
+        return value
+    digest = hashlib.sha256(value.encode()).hexdigest()[:16]
+    return f"{value[:238]}:{digest}"
 
 
 def _use_code_mode(_ctx: Any, tool_definition: Any) -> bool:

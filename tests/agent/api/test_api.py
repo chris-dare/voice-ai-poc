@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from unittest.mock import Mock
 from uuid import UUID
 
 import pytest
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from voice_ai.agent.api.auth import AuthContext
 from voice_ai.agent.api.models import ResponseJob
-from voice_ai.agent.api.router import SharedFixedWindowRateLimiter
+from voice_ai.agent.api.router import SharedFixedWindowRateLimiter, create_api_router
 from voice_ai.agent.api.schemas import (
     ConversationCreateRequest,
     ResponseCreateRequest,
@@ -19,7 +21,7 @@ from voice_ai.agent.api.services import (
     ApiProblem,
     request_fingerprint,
 )
-from voice_ai.agent.app import create_agent_app
+from voice_ai.agent.app import capability_manifest, create_agent_app
 from voice_ai.agent.models import ModelProbe
 from voice_ai.agent.persistence.database import Database
 from voice_ai.agent.persistence.model import TableModel
@@ -172,6 +174,13 @@ class ConcurrencyRuntime(FakeRuntime):
                 self.active -= 1
 
 
+class OversizedRuntime(FakeRuntime):
+    async def stream_turn(self, request: AgentTurnRequest):
+        yield ResponseStarted(turn_id=request.turn_id)
+        yield TextDelta(text="x" * 2_048)
+        yield ResponseCompleted(turn_id=request.turn_id, latency_ms=1)
+
+
 @pytest.fixture
 async def public_service(tmp_path):
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'public-api.db'}")
@@ -275,6 +284,72 @@ async def test_durable_conversation_response_and_replay(public_service, auth) ->
     ]
     assert len(replay) == 1
     assert "event: response.completed" in replay[0]
+
+
+@pytest.mark.asyncio
+async def test_response_execution_audit_is_immutable_safe_and_owner_scoped(
+    public_service,
+    auth,
+) -> None:
+    response, _ = await public_service.create_response(
+        auth,
+        ResponseCreateRequest(
+            agent_id="agent_general_assistant",
+            model="test:assistant",
+            input="Explain the execution route",
+            background=True,
+        ),
+        None,
+    )
+    await public_service.start_response(response["id"])
+    completed = await public_service.wait_for_terminal(response["id"])
+    audit = await public_service.get_response_execution(auth, response["id"])
+
+    assert "execution_snapshot" not in completed
+    assert audit["object"] == "response.execution"
+    assert audit["status"] == "completed"
+    assert audit["schema_version"] == "1"
+    assert audit["agent_definition"]["id"] == "agent_general_assistant"
+    assert audit["agent_definition"]["version"].startswith("sha256:")
+    assert audit["model_route"]["selected_model_id"] == "test:assistant"
+    assert audit["model_route"]["settings"]["thinking_effort"] == "low"
+    assert "web_research" in audit["capability_set"]
+    assert audit["limit_policy"]["limits"]["max_model_requests"] == 16
+    assert audit["policy_version"].startswith("sha256:")
+    assert audit["model_execution"]["attempt_count"] == 0
+    assert "system_prompt" not in str(audit)
+
+    class StaticVerifier:
+        async def verify(self, _token: str) -> AuthContext:
+            return auth
+
+    app = FastAPI()
+    app.include_router(
+        create_api_router(public_service, StaticVerifier(), requests_per_minute=1_000)
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        retrieved = await client.get(
+            f"/v1/responses/{response['id']}/execution",
+            headers={"Authorization": "Bearer test-token"},
+        )
+    assert retrieved.status_code == 200
+    assert retrieved.json()["agent_definition"] == audit["agent_definition"]
+
+    original_definition_version = audit["agent_definition"]["version"]
+    public_service.settings.agent_request_limit = 2
+    unchanged = await public_service.get_response_execution(auth, response["id"])
+    assert unchanged["agent_definition"]["version"] == original_definition_version
+    assert unchanged["limit_policy"]["limits"]["max_model_requests"] == 16
+
+    other = AuthContext(
+        tenant_id="tenant_2",
+        subject_id="auth0|user_2",
+        scopes=auth.scopes,
+        claims={},
+    )
+    with pytest.raises(ApiProblem) as hidden:
+        await public_service.get_response_execution(other, response["id"])
+    assert hidden.value.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -405,6 +480,8 @@ async def test_cancelling_response_waits_for_worker_shutdown(public_service, aut
     cancelled, _ = await public_service.cancel_response(auth, response["id"], "cancel-key")
 
     assert cancelled["status"] == "cancelled"
+    assert cancelled["usage"]["latency"]["completion_ms"] >= 0
+    assert cancelled["usage"]["slo"]["met"]["completion"] is True
     assert runtime.cancelled.is_set()
     assert response["id"] not in public_service._tasks
 
@@ -728,7 +805,7 @@ async def test_expired_worker_lease_is_reclaimed(tmp_path, auth) -> None:
         ),
         None,
     )
-    assert await abandoned._claim_response_job() == (response["id"], None)
+    assert await abandoned._claim_response_job() == (response["id"], None, False)
     async with database.session_factory.begin() as session:
         job = await session.get(ResponseJob, response["id"], with_for_update=True)
         assert job is not None
@@ -751,6 +828,62 @@ async def test_expired_worker_lease_is_reclaimed(tmp_path, auth) -> None:
             assert job.status == "completed"
     finally:
         await recovered.shutdown()
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_and_recovery_metrics_are_emitted_without_tenant_identifiers(
+    tmp_path, auth, monkeypatch
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'metrics.db'}")
+    await database.create_schema()
+    settings = Settings(
+        database_url=str(database.engine.url),
+        agent_embedded_worker=False,
+        agent_job_poll_seconds=0.05,
+    )
+    tool_metric = Mock()
+    recovery_metric = Mock()
+    monkeypatch.setattr("voice_ai.agent.api.services.api.record_agent_tool", tool_metric)
+    monkeypatch.setattr(
+        "voice_ai.agent.api.services.api.record_agent_worker_recovery",
+        recovery_metric,
+    )
+    service = AgentApiService(settings, database, FakeRuntime())  # type: ignore[arg-type]
+    await service.startup()
+    try:
+        response, _ = await service.create_response(
+            auth,
+            ResponseCreateRequest(
+                agent_id="agent_general_assistant",
+                model="test:assistant",
+                input="Check my balance",
+                background=True,
+            ),
+            None,
+        )
+        assert await service._claim_response_job() == (response["id"], None, False)
+        async with database.session_factory.begin() as session:
+            job = await session.get(ResponseJob, response["id"], with_for_update=True)
+            assert job is not None
+            job.lease_expires_at = datetime.now(UTC) - timedelta(milliseconds=25)
+
+        assert await service._claim_response_job() == (response["id"], None, True)
+        await service._execute_claimed_job(response["id"], None)
+
+        recovery_metric.assert_called_once()
+        assert recovery_metric.call_args.kwargs["delay_ms"] >= 0
+        assert tool_metric.call_args.kwargs == {
+            "duration_ms": tool_metric.call_args.kwargs["duration_ms"],
+            "tool": "get_account_balance",
+            "source": "root",
+            "status": "succeeded",
+        }
+        assert tool_metric.call_args.kwargs["duration_ms"] >= 0
+        assert auth.tenant_id not in repr(tool_metric.call_args)
+        assert auth.subject_id not in repr(tool_metric.call_args)
+    finally:
+        await service.shutdown()
         await database.close()
 
 
@@ -819,6 +952,207 @@ async def test_response_queue_applies_bounded_backpressure(tmp_path, auth) -> No
         await database.close()
 
 
+def test_capability_manifest_is_generated_from_effective_limits() -> None:
+    manifest = capability_manifest(
+        Settings(
+            agent_worker_concurrency=7,
+            agent_model_route_concurrency=5,
+            agent_tool_route_concurrency=11,
+            agent_queue_capacity=42,
+            agent_tenant_active_response_limit=3,
+            agent_stream_buffer_capacity=17,
+            agent_max_output_bytes=65_536,
+            agent_deep_agents_enabled=False,
+        )
+    )
+
+    assert manifest["profiles"] == ["core"]
+    assert "specialist_delegation" not in manifest["optional_features"]
+    assert manifest["limits"]["max_concurrent_work"] == 7
+    assert manifest["limits"]["max_concurrent_model_requests_per_route"] == 5
+    assert manifest["limits"]["max_concurrent_tool_calls_per_route"] == 11
+    assert manifest["limits"]["max_queued_work"] == 42
+    assert manifest["limits"]["max_active_responses_per_tenant"] == 3
+    assert manifest["limits"]["max_stream_buffer_events"] == 17
+    assert manifest["limits"]["max_output_bytes"] == 65_536
+
+
+@pytest.mark.asyncio
+async def test_response_output_size_is_enforced_by_server_code(tmp_path, auth) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'output-limit.db'}")
+    await database.create_schema()
+    settings = Settings(
+        database_url=str(database.engine.url),
+        agent_max_output_bytes=1_024,
+        agent_job_poll_seconds=0.05,
+    )
+    service = AgentApiService(
+        settings,
+        database,
+        OversizedRuntime(),  # type: ignore[arg-type]
+    )
+    await service.startup()
+    try:
+        response, _ = await service.create_response(
+            auth,
+            ResponseCreateRequest(
+                agent_id="agent_general_assistant",
+                model="test:assistant",
+                input="Bound this output",
+                background=True,
+            ),
+            None,
+        )
+        failed = await asyncio.wait_for(service.wait_for_terminal(response["id"]), timeout=2)
+
+        assert failed["status"] == "failed"
+        assert failed["error"]["code"] == "output_limit_exceeded"
+        assert not failed["error"]["retryable"]
+    finally:
+        await service.shutdown()
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_tenant_admission_is_bounded_without_blocking_other_tenants(tmp_path, auth) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'tenant-capacity.db'}")
+    await database.create_schema()
+    settings = Settings(
+        database_url=str(database.engine.url),
+        agent_embedded_worker=False,
+        agent_queue_capacity=10,
+        agent_tenant_active_response_limit=1,
+    )
+    service = AgentApiService(settings, database, FakeRuntime())  # type: ignore[arg-type]
+    await service.startup()
+    other_tenant = AuthContext(
+        tenant_id="tenant_2",
+        subject_id=auth.subject_id,
+        scopes=auth.scopes,
+        claims={},
+    )
+    try:
+        await service.create_response(
+            auth,
+            ResponseCreateRequest(
+                agent_id="agent_general_assistant",
+                model="test:assistant",
+                input="First tenant request",
+                background=True,
+            ),
+            None,
+        )
+        with pytest.raises(ApiProblem) as exhausted:
+            await service.create_response(
+                auth,
+                ResponseCreateRequest(
+                    agent_id="agent_general_assistant",
+                    model="test:assistant",
+                    input="Second tenant request",
+                    background=True,
+                ),
+                None,
+            )
+        assert exhausted.value.status_code == 429
+        assert exhausted.value.code == "tenant_capacity_exhausted"
+
+        accepted, _ = await service.create_response(
+            other_tenant,
+            ResponseCreateRequest(
+                agent_id="agent_general_assistant",
+                model="test:assistant",
+                input="Another tenant remains isolated",
+                background=True,
+            ),
+            None,
+        )
+        assert accepted["status"] == "queued"
+    finally:
+        await service.shutdown()
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_jobs_release_process_local_session_and_lock_caches(tmp_path, auth) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'cache-cleanup.db'}")
+    await database.create_schema()
+    settings = Settings(database_url=str(database.engine.url), agent_job_poll_seconds=0.05)
+    runtime = FakeRuntime()
+    service = AgentApiService(settings, database, runtime)  # type: ignore[arg-type]
+    await service.startup()
+    try:
+        response, _ = await service.create_response(
+            auth,
+            ResponseCreateRequest(
+                agent_id="agent_general_assistant",
+                model="test:assistant",
+                input="Release local state",
+                background=True,
+            ),
+            None,
+        )
+        completed = await asyncio.wait_for(service.wait_for_terminal(response["id"]), timeout=2)
+
+        assert completed["status"] == "completed"
+        assert runtime.states == {}
+        assert service._response_locks == {}
+    finally:
+        await service.shutdown()
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_public_api_readiness_requires_a_live_response_worker(
+    tmp_path, auth, monkeypatch
+) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'worker-readiness.db'}"
+    database = Database(database_url)
+    await database.create_schema()
+    await database.close()
+
+    class ReadyRuntime(FakeRuntime):
+        def __init__(self, _settings, **_kwargs) -> None:
+            super().__init__()
+
+        async def startup(self) -> None:
+            pass
+
+        async def shutdown(self) -> None:
+            pass
+
+        async def model_readiness(self) -> dict:
+            return {
+                "ready": True,
+                "model": "test:assistant",
+                "provider": "test",
+                "detail": "ready",
+                "fallbacks": [],
+            }
+
+    class StaticVerifier:
+        async def verify(self, _token: str) -> AuthContext:
+            return auth
+
+    monkeypatch.setattr("voice_ai.agent.app.AgentRuntime", ReadyRuntime)
+    app = create_agent_app(
+        Settings(
+            database_url=database_url,
+            agent_model="test:assistant",
+            api_enabled=True,
+            auth0_domain="tenant.example.auth0.com",
+            auth0_audience="https://voice-api.example.com",
+            agent_embedded_worker=False,
+        ),
+        token_verifier=StaticVerifier(),
+    )
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["response_workers"]["ready"] is False
+
+
 @pytest.mark.asyncio
 async def test_cancellation_reaches_a_different_worker_replica(tmp_path, auth) -> None:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'remote-cancel.db'}")
@@ -854,6 +1188,7 @@ async def test_cancellation_reaches_a_different_worker_replica(tmp_path, auth) -
         cancelled, _ = await api.cancel_response(auth, response["id"], None)
         await asyncio.wait_for(blocking_runtime.cancelled.wait(), timeout=1)
         assert cancelled["status"] == "cancelled"
+        assert api.runtime.states == {}
     finally:
         await worker.shutdown()
         await api.shutdown()
@@ -975,3 +1310,21 @@ async def test_execution_timeout_produces_durable_terminal_failure(tmp_path, aut
     finally:
         await service.shutdown()
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_worker_tasks_are_observed_and_removed(public_service, monkeypatch) -> None:
+    metric = Mock()
+    monkeypatch.setattr("voice_ai.agent.api.services.api.record_agent_job_event", metric)
+
+    async def fail() -> None:
+        raise RuntimeError("simulated worker failure")
+
+    task = asyncio.create_task(fail())
+    public_service._tasks["resp_failed_task"] = task
+    await asyncio.sleep(0)
+
+    public_service._response_task_finished("resp_failed_task", task)
+
+    assert "resp_failed_task" not in public_service._tasks
+    metric.assert_called_once_with(event="task_failed", attempt=0)

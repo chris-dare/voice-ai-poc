@@ -72,6 +72,7 @@ class ResponseRecord(TableModel, table=True):
     error_json: dict[str, Any] | None = Field(default=None, sa_type=JSON, nullable=True)
     usage_json: dict[str, Any] | None = Field(default=None, sa_type=JSON, nullable=True)
     metadata_json: dict[str, Any] = Field(sa_type=JSON, nullable=False)
+    execution_snapshot_json: dict[str, Any] = Field(sa_type=JSON, nullable=False)
     background: bool = Field(sa_type=Boolean, nullable=False)
     stream: bool = Field(sa_type=Boolean, nullable=False)
 
@@ -192,6 +193,30 @@ class ModelAvailability(TableModel, table=True):
     )
 
     __table_args__ = (Index("ix_api_model_availability_status", "status", "checked_at"),)
+
+
+class ExecutionCapacityLease(TableModel, table=True):
+    """Fleet-wide leased slot for a model route or tool execution."""
+
+    __tablename__ = "api_execution_capacity_leases"
+
+    id: str = Field(sa_type=String(64), primary_key=True)
+    resource_kind: str = Field(sa_type=String(24), nullable=False)
+    resource_key: str = Field(sa_type=String(255), nullable=False)
+    owner_id: str = Field(sa_type=String(255), nullable=False)
+    acquired_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    heartbeat_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+    expires_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_api_execution_capacity_resource",
+            "resource_kind",
+            "resource_key",
+            "expires_at",
+        ),
+        Index("ix_api_execution_capacity_expiry", "expires_at"),
+    )
 
 
 class RequiredAction(TableModel, table=True):

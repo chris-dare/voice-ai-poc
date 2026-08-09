@@ -269,6 +269,14 @@ def create_api_router(
         _scopes(auth, "responses:read")
         return JSONResponse(await service.get_response(auth, response_id))
 
+    @router.get("/responses/{response_id}/execution")
+    async def get_response_execution(
+        response_id: str,
+        auth: Annotated[AuthContext, Depends(authorize)],
+    ) -> JSONResponse:
+        _scopes(auth, "responses:read")
+        return JSONResponse(await service.get_response_execution(auth, response_id))
+
     @router.get("/responses/{response_id}/events")
     async def get_response_events(
         response_id: str,
