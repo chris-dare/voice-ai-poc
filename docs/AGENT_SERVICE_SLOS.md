@@ -40,6 +40,14 @@ The agent emits these OpenTelemetry/Logfire metrics without prompt or tool conte
 - `agent.turn.duration`
 - `agent.worker.job`
 - `agent.worker.queue_depth`
+- `agent.worker.recovery.delay`
+- `agent.execution.capacity`
+- `agent.execution.capacity_wait`
+- `agent.response.lifecycle`
+- `agent.response.active`
+- `agent.tool.duration`
+- `voice.session.lifecycle`
+- `voice.session.active`
 
 Model, provider and agent labels are bounded configuration identifiers. Response, subject and
 conversation IDs are deliberately excluded from metric labels; those correlations belong in

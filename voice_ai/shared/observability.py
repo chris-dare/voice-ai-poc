@@ -9,6 +9,7 @@ from typing import Any
 import logfire
 from fastapi import FastAPI
 from loguru import logger
+from opentelemetry import metrics as otel_metrics
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from voice_ai.shared.config import CommonSettings
@@ -16,6 +17,8 @@ from voice_ai.shared.config import CommonSettings
 MessageSender = Callable[[dict[str, Any]], Awaitable[None]]
 
 _logfire_configured = False
+_metrics_configured = False
+_metric_provider: Any = None
 _loguru_sink_id: int | None = None
 _voice_latency = None
 _agent_turn_latency = None
@@ -34,6 +37,14 @@ _eval_runs = None
 _eval_assertion_pass_rate = None
 _agent_job_events = None
 _agent_queue_depth = None
+_agent_response_events = None
+_agent_active_responses = None
+_agent_tool_duration = None
+_agent_worker_recovery = None
+_agent_capacity_events = None
+_agent_capacity_wait = None
+_voice_session_events = None
+_voice_active_sessions = None
 
 
 def configure_observability(settings: CommonSettings, *, service_name: str) -> bool:
@@ -42,8 +53,12 @@ def configure_observability(settings: CommonSettings, *, service_name: str) -> b
     global _model_cost, _model_reported_cost, _model_request_latency, _model_tokens
     global _response_completion, _response_first_text, _response_queue_delay
     global _agent_job_events, _agent_queue_depth
+    global _agent_active_responses, _agent_response_events
+    global _agent_capacity_events, _agent_capacity_wait
+    global _agent_tool_duration, _agent_worker_recovery
     global _eval_assertion_pass_rate, _eval_runs
-    global _logfire_configured, _loguru_sink_id, _startup_latency, _voice_latency
+    global _logfire_configured, _loguru_sink_id
+    global _voice_active_sessions, _voice_session_events
 
     if os.getenv("PYTEST_CURRENT_TEST"):
         return False
@@ -88,91 +103,7 @@ def configure_observability(settings: CommonSettings, *, service_name: str) -> b
                 **logfire.loguru_handler(),
                 level=settings.log_level.upper(),
             )
-            _voice_latency = logfire.metric_histogram(
-                "voice.turn.latency",
-                unit="s",
-                description="User speech stop to assistant speech start",
-            )
-            _agent_turn_latency = logfire.metric_histogram(
-                "agent.turn.duration",
-                unit="ms",
-                description="Agent turn execution time",
-            )
-            _startup_latency = logfire.metric_histogram(
-                "app.startup.duration",
-                unit="s",
-                description="Process or dependency initialization duration",
-            )
-            _auth_events = logfire.metric_counter(
-                "auth.request",
-                unit="1",
-                description="Authentication verification and recovery outcomes",
-            )
-            _auth_iat_offset = logfire.metric_histogram(
-                "auth.token.iat_offset",
-                unit="s",
-                description="Positive access-token issued-at offset from API host time",
-            )
-            _browser_latency = logfire.metric_histogram(
-                "browser.lifecycle.duration",
-                unit="ms",
-                description="Sanitized browser startup and authentication durations",
-            )
-            _model_request_latency = logfire.metric_histogram(
-                "agent.model.request.duration",
-                unit="ms",
-                description="Model request duration observed at the agent boundary",
-            )
-            _model_tokens = logfire.metric_counter(
-                "agent.model.tokens",
-                unit="1",
-                description="Provider-reported model tokens by direction",
-            )
-            _model_cost = logfire.metric_counter(
-                "agent.model.cost.estimated",
-                unit="USD",
-                description="Estimated model cost from the pinned genai-prices snapshot",
-            )
-            _model_reported_cost = logfire.metric_counter(
-                "agent.model.cost.reported",
-                unit="USD",
-                description="Provider-reported billed model cost",
-            )
-            _response_queue_delay = logfire.metric_histogram(
-                "agent.response.queue_delay",
-                unit="ms",
-                description="Accepted response to execution start",
-            )
-            _response_first_text = logfire.metric_histogram(
-                "agent.response.time_to_first_text",
-                unit="ms",
-                description="Execution start to first public text event",
-            )
-            _response_completion = logfire.metric_histogram(
-                "agent.response.completion_duration",
-                unit="ms",
-                description="Execution start to terminal response state",
-            )
-            _eval_runs = logfire.metric_counter(
-                "agent.eval.runs",
-                unit="1",
-                description="Agent evaluation runs by suite, mode, and outcome",
-            )
-            _eval_assertion_pass_rate = logfire.metric_histogram(
-                "agent.eval.assertion_pass_rate",
-                unit="1",
-                description="Fraction of evaluation assertions that passed",
-            )
-            _agent_job_events = logfire.metric_counter(
-                "agent.worker.job",
-                unit="1",
-                description="Durable response job lifecycle events",
-            )
-            _agent_queue_depth = logfire.metric_histogram(
-                "agent.worker.queue_depth",
-                unit="1",
-                description="Observed pending durable response jobs",
-            )
+            _configure_metric_instruments()
             _logfire_configured = True
             logfire.info(
                 "Logfire observability configured for {service_name}",
@@ -183,9 +114,148 @@ def configure_observability(settings: CommonSettings, *, service_name: str) -> b
             return True
         except Exception:
             logger.exception("Logfire instrumentation could not be configured")
-            return False
 
-    return configure_tracing(settings.otlp_endpoint, service_name=service_name)
+    tracing_ready = configure_tracing(settings.otlp_endpoint, service_name=service_name)
+    metrics_ready = configure_otlp_metrics(
+        settings.otlp_metrics_endpoint,
+        service_name=service_name,
+        environment=settings.logfire_environment,
+    )
+    return tracing_ready or metrics_ready
+
+
+def _configure_metric_instruments() -> None:
+    """Create metrics through the OpenTelemetry API for backend portability."""
+    global _agent_turn_latency, _auth_events, _auth_iat_offset, _browser_latency
+    global _model_cost, _model_reported_cost, _model_request_latency, _model_tokens
+    global _response_completion, _response_first_text, _response_queue_delay
+    global _agent_job_events, _agent_queue_depth
+    global _agent_active_responses, _agent_response_events
+    global _agent_capacity_events, _agent_capacity_wait
+    global _agent_tool_duration, _agent_worker_recovery
+    global _eval_assertion_pass_rate, _eval_runs
+    global _metrics_configured, _startup_latency, _voice_latency
+    global _voice_active_sessions, _voice_session_events
+
+    if _metrics_configured:
+        return
+    meter = otel_metrics.get_meter("voice_ai", _service_version())
+    _voice_latency = meter.create_histogram(
+        "voice.turn.latency", unit="s", description="User speech stop to assistant speech start"
+    )
+    _agent_turn_latency = meter.create_histogram(
+        "agent.turn.duration", unit="ms", description="Agent turn execution time"
+    )
+    _startup_latency = meter.create_histogram(
+        "app.startup.duration",
+        unit="s",
+        description="Process or dependency initialization duration",
+    )
+    _auth_events = meter.create_counter(
+        "auth.request",
+        unit="1",
+        description="Authentication verification and recovery outcomes",
+    )
+    _auth_iat_offset = meter.create_histogram(
+        "auth.token.iat_offset",
+        unit="s",
+        description="Positive access-token issued-at offset from API host time",
+    )
+    _browser_latency = meter.create_histogram(
+        "browser.lifecycle.duration",
+        unit="ms",
+        description="Sanitized browser startup and authentication durations",
+    )
+    _model_request_latency = meter.create_histogram(
+        "agent.model.request.duration",
+        unit="ms",
+        description="Model request duration observed at the agent boundary",
+    )
+    _model_tokens = meter.create_counter(
+        "agent.model.tokens", unit="1", description="Provider-reported model tokens by direction"
+    )
+    _model_cost = meter.create_counter(
+        "agent.model.cost.estimated",
+        unit="USD",
+        description="Estimated model cost from the pinned genai-prices snapshot",
+    )
+    _model_reported_cost = meter.create_counter(
+        "agent.model.cost.reported",
+        unit="USD",
+        description="Provider-reported billed model cost",
+    )
+    _response_queue_delay = meter.create_histogram(
+        "agent.response.queue_delay",
+        unit="ms",
+        description="Accepted response to execution start",
+    )
+    _response_first_text = meter.create_histogram(
+        "agent.response.time_to_first_text",
+        unit="ms",
+        description="Execution start to first public text event",
+    )
+    _response_completion = meter.create_histogram(
+        "agent.response.completion_duration",
+        unit="ms",
+        description="Execution start to terminal response state",
+    )
+    _eval_runs = meter.create_counter(
+        "agent.eval.runs",
+        unit="1",
+        description="Agent evaluation runs by suite, mode, and outcome",
+    )
+    _eval_assertion_pass_rate = meter.create_histogram(
+        "agent.eval.assertion_pass_rate",
+        unit="1",
+        description="Fraction of evaluation assertions that passed",
+    )
+    _agent_job_events = meter.create_counter(
+        "agent.worker.job", unit="1", description="Durable response job lifecycle events"
+    )
+    _agent_queue_depth = meter.create_histogram(
+        "agent.worker.queue_depth", unit="1", description="Observed pending durable response jobs"
+    )
+    _agent_response_events = meter.create_counter(
+        "agent.response.lifecycle",
+        unit="1",
+        description="Accepted and terminal durable response outcomes",
+    )
+    _agent_active_responses = meter.create_gauge(
+        "agent.response.active",
+        unit="1",
+        description="Observed non-terminal durable responses",
+    )
+    _agent_tool_duration = meter.create_histogram(
+        "agent.tool.duration",
+        unit="ms",
+        description="Tool execution duration by tool, source, and outcome",
+    )
+    _agent_worker_recovery = meter.create_histogram(
+        "agent.worker.recovery.delay",
+        unit="ms",
+        description="Expired lease to successful recovery claim delay",
+    )
+    _agent_capacity_events = meter.create_counter(
+        "agent.execution.capacity",
+        unit="1",
+        description="Fleet-wide model and tool capacity lifecycle outcomes",
+    )
+    _agent_capacity_wait = meter.create_histogram(
+        "agent.execution.capacity_wait",
+        unit="ms",
+        description="Wait time to acquire a fleet-wide model or tool slot",
+    )
+    _voice_session_events = meter.create_counter(
+        "voice.session.lifecycle",
+        unit="1",
+        description="Voice session admission and release outcomes",
+    )
+    _voice_active_sessions = meter.create_gauge(
+        "voice.session.active",
+        unit="1",
+        description="Active WebRTC voice sessions on this gateway replica",
+    )
+    _metrics_configured = True
 
 
 def instrument_fastapi(app: FastAPI) -> None:
@@ -280,6 +350,67 @@ def record_agent_queue_depth(depth: int) -> None:
         _agent_queue_depth.record(depth, {"workload": "interactive"})
 
 
+def record_agent_response_event(*, event: str, status: str) -> None:
+    if _agent_response_events is not None:
+        _agent_response_events.add(
+            1,
+            {"event": event, "status": status, "workload": "interactive"},
+        )
+
+
+def record_agent_active_responses(active: int) -> None:
+    if _agent_active_responses is not None:
+        _agent_active_responses.set(active, {"workload": "interactive"})
+
+
+def record_agent_tool(
+    *,
+    duration_ms: float,
+    tool: str,
+    source: str,
+    status: str,
+) -> None:
+    if _agent_tool_duration is not None:
+        _agent_tool_duration.record(
+            duration_ms,
+            {"tool": tool, "source": source, "status": status},
+        )
+
+
+def record_agent_worker_recovery(*, delay_ms: float, attempt: int) -> None:
+    if _agent_worker_recovery is not None:
+        _agent_worker_recovery.record(
+            delay_ms,
+            {"attempt": attempt, "workload": "interactive"},
+        )
+
+
+def record_agent_capacity(
+    *,
+    event: str,
+    resource_kind: str,
+    resource_key: str,
+    wait_ms: float,
+) -> None:
+    attributes = {
+        "event": event,
+        "resource_kind": resource_kind,
+        "resource_key": resource_key,
+    }
+    if _agent_capacity_events is not None:
+        _agent_capacity_events.add(1, attributes)
+    if _agent_capacity_wait is not None and event in {"acquired", "rejected"}:
+        _agent_capacity_wait.record(wait_ms, attributes)
+
+
+def record_voice_session(*, event: str, active: int) -> None:
+    attributes = {"event": event, "gateway": "local_voice"}
+    if _voice_session_events is not None:
+        _voice_session_events.add(1, attributes)
+    if _voice_active_sessions is not None:
+        _voice_active_sessions.set(active, {"gateway": "local_voice"})
+
+
 def record_eval_run(
     *,
     suite_version: str,
@@ -347,6 +478,47 @@ def configure_tracing(endpoint: str | None, *, service_name: str = "voice-ai") -
         )
     except Exception:
         logger.exception("Optional OTLP tracing could not be configured")
+        return False
+
+
+def configure_otlp_metrics(
+    endpoint: str | None,
+    *,
+    service_name: str,
+    environment: str,
+) -> bool:
+    """Export the same application metrics to any OTLP/HTTP-compatible backend."""
+    global _metric_provider
+
+    if not endpoint:
+        return False
+    try:
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
+            OTLPMetricExporter,
+        )
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+        from opentelemetry.sdk.resources import Resource
+
+        exporter = OTLPMetricExporter(endpoint=endpoint)
+        reader = PeriodicExportingMetricReader(exporter)
+        provider = MeterProvider(
+            metric_readers=[reader],
+            resource=Resource.create(
+                {
+                    "service.name": service_name,
+                    "service.version": _service_version(),
+                    "service.instance.id": f"{socket.gethostname()}:{os.getpid()}",
+                    "deployment.environment": environment,
+                }
+            ),
+        )
+        otel_metrics.set_meter_provider(provider)
+        _metric_provider = provider
+        _configure_metric_instruments()
+        return True
+    except Exception:
+        logger.exception("Optional OTLP metrics could not be configured")
         return False
 
 

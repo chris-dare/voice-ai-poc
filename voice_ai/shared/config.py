@@ -8,6 +8,8 @@ from typing import Annotated, Literal
 from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from voice_ai import __version__
+
 
 class IceServer(BaseSettings):
     urls: str | list[str]
@@ -29,6 +31,7 @@ class CommonSettings(BaseSettings):
     app_name: str = "Voice AI"
     log_level: str = "INFO"
     otlp_endpoint: str | None = None
+    otlp_metrics_endpoint: str | None = None
     logfire_enabled: bool = False
     logfire_environment: str = "development"
     logfire_capture_content: bool = False
@@ -81,6 +84,7 @@ class AgentSettings(AuthSettings):
     agent_host: str = "127.0.0.1"
     agent_port: int = 8100
     agent_deployment_profile: Literal["laptop", "public"] = "laptop"
+    agent_release_version: str = Field(default=__version__, min_length=1, max_length=255)
     agent_shared_secret: str | None = None
     api_rate_limit_rpm: int = Field(
         default=60,
@@ -130,6 +134,7 @@ class AgentSettings(AuthSettings):
     agent_request_limit: int = Field(default=16, ge=1, le=50)
     agent_tool_call_limit: int = Field(default=30, ge=1, le=200)
     agent_total_token_limit: int = Field(default=40_000, ge=512, le=200_000)
+    agent_max_output_bytes: int = Field(default=1_048_576, ge=1_024, le=100_000_000)
     agent_subagent_request_limit: int = Field(default=6, ge=1, le=25)
     agent_subagent_tool_call_limit: int = Field(default=8, ge=1, le=50)
     agent_subagent_total_token_limit: int = Field(default=10_000, ge=512, le=100_000)
@@ -139,7 +144,15 @@ class AgentSettings(AuthSettings):
     agent_eval_judge_model: str | None = None
     agent_embedded_worker: bool = True
     agent_worker_concurrency: int = Field(default=4, ge=1, le=128)
+    agent_model_route_concurrency: int = Field(default=8, ge=1, le=10_000)
+    agent_tool_route_concurrency: int = Field(default=8, ge=1, le=10_000)
+    agent_capacity_wait_seconds: float = Field(default=30, ge=0.1, le=3_600)
+    agent_capacity_lease_seconds: int = Field(default=120, ge=15, le=3_600)
+    agent_capacity_heartbeat_seconds: int = Field(default=15, ge=1, le=300)
     agent_queue_capacity: int = Field(default=1_000, ge=1, le=1_000_000)
+    agent_tenant_active_response_limit: int = Field(default=25, ge=1, le=100_000)
+    agent_stream_buffer_capacity: int = Field(default=128, ge=1, le=10_000)
+    agent_event_broker_capacity: int = Field(default=10_000, ge=1, le=1_000_000)
     agent_execution_timeout_seconds: int = Field(default=300, ge=1, le=86_400)
     agent_worker_presence_ttl_seconds: int = Field(default=30, ge=5, le=300)
     agent_job_max_attempts: int = Field(default=3, ge=1, le=20)
@@ -211,6 +224,8 @@ class AgentSettings(AuthSettings):
             )
         if self.agent_embedded_worker:
             errors.append("AGENT_EMBEDDED_WORKER must be false in the public profile")
+        if not self.database_url.startswith("postgresql+asyncpg://"):
+            errors.append("DATABASE_URL must use postgresql+asyncpg in the public agent profile")
         return errors
 
 
@@ -246,6 +261,12 @@ class VoiceSettings(AuthSettings):
     def public_profile_errors(self) -> list[str]:
         errors: list[str] = []
         if self.deployment_profile == "public":
+            if not self.api_enabled:
+                errors.append("API_ENABLED must be true in the public voice profile")
+            else:
+                errors.extend(self.api_auth_errors())
+            if not self.auth0_spa_client_id:
+                errors.append("AUTH0_SPA_CLIENT_ID is required in the public voice profile")
             if not self.public_base_url or not self.public_base_url.startswith("https://"):
                 errors.append("PUBLIC_BASE_URL must be an https:// URL in the public profile")
             has_turn = any(

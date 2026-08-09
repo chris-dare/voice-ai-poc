@@ -30,14 +30,39 @@ def test_public_agent_profile_rejects_unsafe_process_configuration() -> None:
     assert any("AGENT_EMBEDDED_WORKER" in error for error in errors)
 
 
+def test_public_agent_profile_accepts_only_the_distributed_database_configuration() -> None:
+    safe = AgentSettings(
+        _env_file=None,
+        agent_deployment_profile="public",
+        api_enabled=True,
+        auth0_domain="tenant.example.auth0.com",
+        auth0_audience="https://agent.example.com",
+        agent_model="openrouter:openai/example",
+        agent_shared_secret="a" * 32,
+        agent_embedded_worker=False,
+        database_url="postgresql+asyncpg://agent:secret@postgres:5432/agent",
+    )
+    unsafe = safe.model_copy(
+        update={"database_url": "sqlite+aiosqlite:///accidental-production.db"}
+    )
+
+    assert safe.production_errors() == []
+    assert any("postgresql+asyncpg" in error for error in unsafe.production_errors())
+
+
 def test_public_profile_requires_https_and_turn() -> None:
-    settings = Settings(
+    settings = VoiceSettings(
+        _env_file=None,
         deployment_profile="public",
         public_base_url="http://voice.example",
         ice_servers=[],
     )
 
-    assert len(settings.public_profile_errors()) == 2
+    errors = settings.public_profile_errors()
+    assert any("API_ENABLED" in error for error in errors)
+    assert any("AUTH0_SPA_CLIENT_ID" in error for error in errors)
+    assert any("https://" in error for error in errors)
+    assert any("TURN" in error for error in errors)
 
 
 def test_ice_servers_parse_from_environment_shape() -> None:
@@ -51,8 +76,13 @@ def test_ice_servers_parse_from_environment_shape() -> None:
         ]
     )
 
-    settings = Settings(
+    settings = VoiceSettings(
+        _env_file=None,
         deployment_profile="public",
+        api_enabled=True,
+        auth0_domain="tenant.example.auth0.com",
+        auth0_audience="https://agent.example.com",
+        auth0_spa_client_id="spa-client-id",
         public_base_url="https://voice.example",
         ice_servers=raw,
     )
@@ -87,6 +117,19 @@ def test_logfire_content_capture_is_private_by_default() -> None:
     assert not settings.logfire_enabled
     assert not settings.logfire_capture_content
     assert settings.logfire_environment == "development"
+
+
+def test_agent_process_memory_and_tenant_capacity_are_bounded_by_default() -> None:
+    settings = AgentSettings(_env_file=None)
+
+    assert settings.agent_tenant_active_response_limit > 0
+    assert settings.agent_stream_buffer_capacity > 0
+    assert settings.agent_event_broker_capacity > 0
+    assert settings.agent_max_output_bytes > 0
+    assert settings.agent_model_route_concurrency > 0
+    assert settings.agent_tool_route_concurrency > 0
+    assert settings.agent_capacity_wait_seconds > 0
+    assert settings.agent_release_version
 
 
 def test_auth0_iat_skew_is_narrow_and_configurable() -> None:

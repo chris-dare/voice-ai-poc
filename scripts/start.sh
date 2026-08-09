@@ -79,7 +79,8 @@ wait_for_worker() {
   for _attempt in {1..60}; do
     local body
     body="$(curl --fail --silent 'http://127.0.0.1:8100/readyz' 2>/dev/null || true)"
-    if [[ "$body" == *'"response_workers":{"ready":true'* ]]; then
+    if grep -Fq 'Agent response worker started worker_id=' "$RUN_DIR/worker.log" 2>/dev/null \
+      && [[ "$body" == *'"response_workers":{"ready":true'* ]]; then
       log 'Durable agent worker is registered and ready.'
       return
     fi
@@ -131,12 +132,14 @@ trap cleanup EXIT INT TERM
 log 'Starting agent service…'
 AGENT_EMBEDDED_WORKER=false uv run --env-file "$ENV_FILE" voice-ai agent > >(tee "$RUN_DIR/agent.log") 2>&1 &
 AGENT_PID=$!
-wait_for_url 'agent' 'http://127.0.0.1:8100/readyz' "$AGENT_PID"
+wait_for_url 'agent' 'http://127.0.0.1:8100/livez' "$AGENT_PID"
 
 log 'Starting durable agent worker…'
-uv run --env-file "$ENV_FILE" voice-ai worker > >(tee "$RUN_DIR/worker.log") 2>&1 &
+: > "$RUN_DIR/worker.log"
+uv run --env-file "$ENV_FILE" voice-ai worker > >(tee -a "$RUN_DIR/worker.log") 2>&1 &
 WORKER_PID=$!
 wait_for_worker
+wait_for_url 'agent' 'http://127.0.0.1:8100/readyz' "$AGENT_PID"
 
 log 'Starting voice gateway and UI…'
 uv run --env-file "$ENV_FILE" voice-ai serve > >(tee "$RUN_DIR/gateway.log") 2>&1 &
