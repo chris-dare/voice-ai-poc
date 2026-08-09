@@ -1,14 +1,52 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from voice_ai.shared.config import Settings
-from voice_ai.voice.app import SessionCapacity, create_app
+from voice_ai.voice.app import SessionCapacity, _run_session_lazy, create_app
 from voice_ai.voice.health import CheckResult
 from voice_ai.voice.runtime import run_session
+
+
+@pytest.mark.asyncio
+async def test_voice_session_capacity_emits_admission_and_saturation_metrics(monkeypatch) -> None:
+    metric = Mock()
+    monkeypatch.setattr("voice_ai.voice.app.record_voice_session", metric)
+    capacity = SessionCapacity(1)
+
+    assert await capacity.reserve()
+    assert not await capacity.reserve()
+    await capacity.release()
+
+    assert [call.kwargs for call in metric.call_args_list] == [
+        {"event": "accepted", "active": 1},
+        {"event": "rejected", "active": 1},
+        {"event": "released", "active": 0},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lazy_voice_runtime_failure_releases_reserved_capacity(monkeypatch) -> None:
+    capacity = SessionCapacity(1)
+    assert await capacity.reserve()
+
+    def fail_import(_name: str):
+        raise ImportError("voice runtime unavailable")
+
+    monkeypatch.setattr("voice_ai.voice.app.importlib.import_module", fail_import)
+
+    with pytest.raises(ImportError, match="voice runtime unavailable"):
+        await _run_session_lazy(
+            connection=Mock(),
+            settings=Mock(),
+            capacity=capacity,
+        )
+
+    assert capacity.active == 0
 
 
 @pytest.mark.asyncio
@@ -86,6 +124,76 @@ async def test_browser_config_exposes_only_public_auth_values(tmp_path) -> None:
         },
     }
     assert "must-not-leak" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_health_does_not_expose_turn_credentials(tmp_path) -> None:
+    settings = Settings(
+        frontend_dist=tmp_path,
+        ice_servers=[
+            {
+                "urls": "turn:turn.example.com:3478",
+                "username": "turn-user-must-not-leak",
+                "credential": "turn-secret-must-not-leak",
+            }
+        ],
+    )
+    app = create_app(settings)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.json()["ice_server_count"] == 1
+    assert "turn-user-must-not-leak" not in response.text
+    assert "turn-secret-must-not-leak" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_voice_config_requires_and_validates_authentication(tmp_path, monkeypatch) -> None:
+    validate = AsyncMock()
+    monkeypatch.setattr("voice_ai.voice.app._validate_public_access_token", validate)
+    app = create_app(
+        Settings(
+            api_enabled=True,
+            auth0_domain="tenant.example.auth0.com",
+            auth0_audience="https://agent.example.com",
+            auth0_spa_client_id="spa-client-id",
+            frontend_dist=tmp_path,
+            ice_servers=[
+                {
+                    "urls": "turn:turn.example.com:3478",
+                    "username": "turn-user",
+                    "credential": "turn-secret",
+                }
+            ],
+        )
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        unauthenticated = await client.get("/api/voice-config")
+        authenticated = await client.get(
+            "/api/voice-config",
+            headers={"Authorization": "Bearer user-token"},
+        )
+
+    assert unauthenticated.status_code == 401
+    assert authenticated.status_code == 200
+    assert authenticated.json() == {
+        "ice_servers": [
+            {
+                "urls": "turn:turn.example.com:3478",
+                "username": "turn-user",
+                "credential": "turn-secret",
+            }
+        ]
+    }
+    validate.assert_awaited_once()
+    assert validate.await_args.kwargs["access_token"] == "user-token"
 
 
 @pytest.mark.asyncio
@@ -260,3 +368,122 @@ async def test_authenticated_voice_offer_requires_model_selection(tmp_path, monk
 
     assert response.status_code == 422
     assert response.json()["detail"] == "A model selection is required for voice"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_voice_signaling_is_bound_to_the_creating_token(
+    tmp_path, monkeypatch
+) -> None:
+    stop_session = asyncio.Event()
+    session_finished = asyncio.Event()
+
+    class FakeConnection:
+        pc_id = "pc_owned"
+
+    class FakeRequestHandler:
+        def __init__(self, **_kwargs) -> None:
+            self.connection = FakeConnection()
+            self.patch_count = 0
+
+        async def handle_web_request(self, *, request, webrtc_connection_callback):
+            if request.pc_id is None:
+                await webrtc_connection_callback(self.connection)
+            return {"pc_id": self.connection.pc_id, "sdp": "answer", "type": "answer"}
+
+        async def handle_patch_request(self, _request) -> None:
+            self.patch_count += 1
+
+        async def close(self) -> None:
+            pass
+
+    async def run_session_until_stopped(*, capacity, **_kwargs) -> None:
+        try:
+            await stop_session.wait()
+        finally:
+            await capacity.release()
+            session_finished.set()
+
+    monkeypatch.setattr(
+        "voice_ai.voice.runtime.SmallWebRTCRequestHandler",
+        FakeRequestHandler,
+    )
+    monkeypatch.setattr(
+        "voice_ai.voice.runtime.run_voice_checks",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "voice_ai.voice.runtime.run_session",
+        run_session_until_stopped,
+    )
+    monkeypatch.setattr(
+        "voice_ai.voice.app._validate_voice_conversation",
+        AsyncMock(),
+    )
+    app = create_app(
+        Settings(
+            api_enabled=True,
+            auth0_domain="tenant.example.auth0.com",
+            auth0_audience="https://agent.example.com",
+            auth0_spa_client_id="spa-client-id",
+            frontend_dist=tmp_path,
+        )
+    )
+    owner_headers = {
+        "Authorization": "Bearer owner-token",
+        "X-Conversation-Id": "conv_test",
+        "X-Model-Id": "test:assistant",
+    }
+
+    async with app.router.lifespan_context(app):
+        await app.state.voice_initialization
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            initial = await client.post(
+                "/api/offer",
+                headers=owner_headers,
+                json={"sdp": "offer", "type": "offer"},
+            )
+            same_owner = await client.post(
+                "/api/offer",
+                headers={"Authorization": "Bearer owner-token"},
+                json={"pc_id": "pc_owned", "sdp": "offer", "type": "offer"},
+            )
+            wrong_owner = await client.post(
+                "/api/offer",
+                headers={"Authorization": "Bearer another-token"},
+                json={"pc_id": "pc_owned", "sdp": "offer", "type": "offer"},
+            )
+            missing_token = await client.post(
+                "/api/offer",
+                json={"pc_id": "pc_owned", "sdp": "offer", "type": "offer"},
+            )
+            owner_patch = await client.patch(
+                "/api/offer",
+                headers={"Authorization": "Bearer owner-token"},
+                json={"pc_id": "pc_owned", "candidates": []},
+            )
+            wrong_owner_patch = await client.patch(
+                "/api/offer",
+                headers={"Authorization": "Bearer another-token"},
+                json={"pc_id": "pc_owned", "candidates": []},
+            )
+            active_health = await client.get("/healthz")
+
+            stop_session.set()
+            await asyncio.wait_for(session_finished.wait(), timeout=1)
+            for _ in range(10):
+                finished_health = await client.get("/healthz")
+                if finished_health.json()["authenticated_sessions"] == 0:
+                    break
+                await asyncio.sleep(0)
+
+    assert initial.status_code == 200
+    assert same_owner.status_code == 200
+    assert wrong_owner.status_code == 404
+    assert missing_token.status_code == 401
+    assert owner_patch.status_code == 200
+    assert wrong_owner_patch.status_code == 404
+    assert active_health.json()["authenticated_sessions"] == 1
+    assert finished_health.json()["authenticated_sessions"] == 0

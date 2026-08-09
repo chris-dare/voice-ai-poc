@@ -68,8 +68,8 @@ async def run_session(
     conversation_id: str | None = None,
     model_id: str | None = None,
 ) -> None:
-    runner = WorkerRunner(handle_sigint=False, handle_sigterm=False)
     try:
+        runner = WorkerRunner(handle_sigint=False, handle_sigterm=False)
         session = create_voice_session(
             connection=connection,
             settings=settings,
@@ -95,7 +95,8 @@ async def run_session(
         )
         await runner_task
     except asyncio.CancelledError:
-        await runner.cancel(reason="Server shutting down")
+        if "runner" in locals():
+            await runner.cancel(reason="Server shutting down")
         raise
     except Exception:
         logger.exception("Voice session failed")

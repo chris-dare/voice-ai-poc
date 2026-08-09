@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import importlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -22,6 +24,7 @@ from voice_ai.shared.observability import (
     record_auth_event,
     record_browser_latency,
     record_startup_latency,
+    record_voice_session,
 )
 from voice_ai.shared.startup import PROCESS_STARTED_AT
 
@@ -35,13 +38,55 @@ class SessionCapacity:
     async def reserve(self) -> bool:
         async with self._lock:
             if self.active >= self.maximum:
+                record_voice_session(event="rejected", active=self.active)
                 return False
             self.active += 1
+            record_voice_session(event="accepted", active=self.active)
             return True
 
     async def release(self) -> None:
         async with self._lock:
-            self.active = max(0, self.active - 1)
+            if self.active > 0:
+                self.active -= 1
+                record_voice_session(event="released", active=self.active)
+
+
+class SessionOwnership:
+    """Bind active WebRTC peer IDs to the access token that created them.
+
+    Only a one-way fingerprint is retained, and entries live no longer than the
+    corresponding in-process voice session.
+    """
+
+    def __init__(self) -> None:
+        self._owners: dict[str, bytes] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _fingerprint(access_token: str) -> bytes:
+        return hashlib.sha256(access_token.encode("utf-8")).digest()
+
+    async def bind(self, pc_id: str, access_token: str) -> None:
+        fingerprint = self._fingerprint(access_token)
+        async with self._lock:
+            existing = self._owners.get(pc_id)
+            if existing is not None and not hmac.compare_digest(existing, fingerprint):
+                raise RuntimeError("Peer connection ownership conflict")
+            self._owners[pc_id] = fingerprint
+
+    async def owns(self, pc_id: str, access_token: str) -> bool:
+        fingerprint = self._fingerprint(access_token)
+        async with self._lock:
+            existing = self._owners.get(pc_id)
+            return existing is not None and hmac.compare_digest(existing, fingerprint)
+
+    async def release(self, pc_id: str) -> None:
+        async with self._lock:
+            self._owners.pop(pc_id, None)
+
+    @property
+    def active(self) -> int:
+        return len(self._owners)
 
 
 class BrowserTelemetry(BaseModel):
@@ -65,6 +110,7 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
     configured = settings or get_voice_settings()
     configure_observability(configured, service_name="voice-ai-gateway")
     capacity = SessionCapacity(configured.max_concurrent_sessions)
+    ownership = SessionOwnership()
     session_tasks: set[asyncio.Task[Any]] = set()
     agent_client: httpx.AsyncClient | None = None
     voice_runtime: Any = None
@@ -151,15 +197,9 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
                 "status": voice_status,
                 "checks": [check.as_dict() for check in voice_checks],
                 "active_sessions": capacity.active,
+                "authenticated_sessions": ownership.active,
                 "max_concurrent_sessions": capacity.maximum,
-                "ice_servers": [
-                    {
-                        "urls": server.urls,
-                        "username": server.username,
-                        "credential": server.credential,
-                    }
-                    for server in configured.ice_servers
-                ],
+                "ice_server_count": len(configured.ice_servers),
             },
             status_code=503 if voice_status in {"warming", "not_ready"} else 200,
         )
@@ -183,6 +223,29 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
                 "client_id": configured.auth0_spa_client_id if browser_auth_enabled else None,
                 "audience": configured.auth0_audience if browser_auth_enabled else None,
             },
+        }
+
+    @app.get("/api/voice-config", include_in_schema=False)
+    async def browser_voice_config(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        if browser_auth_enabled:
+            if not authorization or not authorization.startswith("Bearer "):
+                raise HTTPException(401, "A bearer access token is required")
+            await _validate_public_access_token(
+                client=agent_client,
+                base_url=configured.agent_base_url,
+                access_token=authorization.removeprefix("Bearer ").strip(),
+            )
+        return {
+            "ice_servers": [
+                {
+                    "urls": server.urls,
+                    "username": server.username,
+                    "credential": server.credential,
+                }
+                for server in configured.ice_servers
+            ],
         }
 
     @app.post("/api/telemetry", include_in_schema=False, status_code=204)
@@ -301,15 +364,13 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
         model_id: str | None = None
         if voice_request.pc_id is None:
             if browser_auth_enabled:
-                if not authorization or not authorization.startswith("Bearer "):
-                    raise HTTPException(401, "A bearer access token is required")
+                public_access_token = _bearer_token(authorization)
                 conversation_id = (x_conversation_id or "").strip()
                 if not conversation_id:
                     raise HTTPException(422, "A conversation_id is required for voice")
                 model_id = (x_model_id or "").strip()
                 if not model_id:
                     raise HTTPException(422, "A model selection is required for voice")
-                public_access_token = authorization.removeprefix("Bearer ").strip()
                 await _validate_voice_conversation(
                     client=agent_client,
                     base_url=configured.agent_base_url,
@@ -318,11 +379,19 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
                 )
             if not await capacity.reserve():
                 raise HTTPException(429, "The local voice assistant is busy; try again shortly")
+        elif browser_auth_enabled:
+            public_access_token = _bearer_token(authorization)
+            if not await ownership.owns(voice_request.pc_id, public_access_token):
+                # Do not reveal whether the peer exists or belongs to another user.
+                raise HTTPException(404, "Peer connection not found")
         reserved = voice_request.pc_id is None
         task_started = False
 
         async def on_connection(connection) -> None:
             nonlocal task_started
+            if browser_auth_enabled:
+                assert public_access_token is not None
+                await ownership.bind(connection.pc_id, public_access_token)
             task = asyncio.create_task(
                 _run_session_lazy(
                     connection=connection,
@@ -331,11 +400,21 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
                     public_access_token=public_access_token,
                     conversation_id=conversation_id,
                     model_id=model_id,
+                    ownership=ownership if browser_auth_enabled else None,
+                    pc_id=connection.pc_id,
                 )
             )
             session_tasks.add(task)
-            task.add_done_callback(session_tasks.discard)
+            task.add_done_callback(_session_finished)
             task_started = True
+
+        def _session_finished(task: asyncio.Task[Any]) -> None:
+            session_tasks.discard(task)
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                logger.opt(exception=error).error("Voice session task failed before startup")
 
         try:
             return await voice_runtime.request_handler.handle_web_request(
@@ -348,10 +427,18 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
             raise
 
     @app.patch("/api/offer")
-    async def ice_candidate(request: dict[str, Any]) -> dict[str, str]:
+    async def ice_candidate(
+        request: dict[str, Any],
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, str]:
         if voice_runtime is None:
             raise HTTPException(503, "Voice services are still warming up")
-        await voice_runtime.request_handler.handle_patch_request(voice_runtime.parse_patch(request))
+        voice_request = voice_runtime.parse_patch(request)
+        if browser_auth_enabled:
+            access_token = _bearer_token(authorization)
+            if not await ownership.owns(voice_request.pc_id, access_token):
+                raise HTTPException(404, "Peer connection not found")
+        await voice_runtime.request_handler.handle_patch_request(voice_request)
         return {"status": "success"}
 
     dist = _resolve_frontend(configured.frontend_dist)
@@ -380,16 +467,39 @@ async def _run_session_lazy(
     public_access_token: str | None = None,
     conversation_id: str | None = None,
     model_id: str | None = None,
+    ownership: SessionOwnership | None = None,
+    pc_id: str | None = None,
 ) -> None:
-    module = await asyncio.to_thread(importlib.import_module, "voice_ai.voice.runtime")
-    await module.run_session(
-        connection=connection,
-        settings=settings,
-        capacity=capacity,
-        public_access_token=public_access_token,
-        conversation_id=conversation_id,
-        model_id=model_id,
-    )
+    try:
+        module = await asyncio.to_thread(importlib.import_module, "voice_ai.voice.runtime")
+    except BaseException:
+        # run_session owns normal release. If lazy import itself fails, it never
+        # receives control, so return the reserved slot here.
+        await capacity.release()
+        if ownership is not None and pc_id is not None:
+            await ownership.release(pc_id)
+        raise
+    try:
+        await module.run_session(
+            connection=connection,
+            settings=settings,
+            capacity=capacity,
+            public_access_token=public_access_token,
+            conversation_id=conversation_id,
+            model_id=model_id,
+        )
+    finally:
+        if ownership is not None and pc_id is not None:
+            await ownership.release(pc_id)
+
+
+def _bearer_token(authorization: str | None) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "A bearer access token is required")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(401, "A bearer access token is required")
+    return token
 
 
 async def _validate_voice_conversation(
@@ -413,6 +523,28 @@ async def _validate_voice_conversation(
     if response.status_code in {401, 403, 404}:
         raise HTTPException(response.status_code, "Voice conversation access was denied")
     raise HTTPException(503, "The agent service could not validate the conversation")
+
+
+async def _validate_public_access_token(
+    *,
+    client: httpx.AsyncClient | None,
+    base_url: str,
+    access_token: str,
+) -> None:
+    if client is None:
+        raise HTTPException(503, "The agent gateway is starting")
+    try:
+        response = await client.get(
+            f"{base_url.rstrip('/')}/v1/models",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, "The agent service is unavailable") from exc
+    if response.status_code == 200:
+        return
+    if response.status_code in {401, 403}:
+        raise HTTPException(response.status_code, "Voice configuration access was denied")
+    raise HTTPException(503, "The agent service could not validate this session")
 
 
 def _resolve_frontend(path: Path) -> Path:

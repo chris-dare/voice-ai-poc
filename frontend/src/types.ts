@@ -69,6 +69,10 @@ export interface Notice {
 export interface HealthState {
   status: string;
   checks?: Array<{ name?: string; status?: string }>;
+  ice_server_count?: number;
+}
+
+export interface VoiceConfig {
   ice_servers?: Array<{ urls: string | string[]; username?: string; credential?: string }>;
 }
 

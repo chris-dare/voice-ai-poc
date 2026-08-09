@@ -17,6 +17,7 @@ import type {
   Notice,
   RequiredAction,
   ToolActivity,
+  VoiceConfig,
   VoiceState,
   VoiceVisualState,
 } from "../types";
@@ -623,11 +624,18 @@ export function useVoiceAI() {
   }, [addGlobalToolActivity, addVoiceLatency, setVoicePresentation, showNotice]);
 
   const createVoiceClient = useCallback(async () => {
+    const accessToken = await apiRef.current!.accessToken();
+    const voiceConfigResponse = await fetch("/api/voice-config", {
+      cache: "no-store",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!voiceConfigResponse.ok) throw await apiError(voiceConfigResponse);
+    const voiceConfig = await voiceConfigResponse.json() as VoiceConfig;
     const [{ PipecatClient }, { SmallWebRTCTransport }] = await Promise.all([
       import("@pipecat-ai/client-js"),
       import("@pipecat-ai/small-webrtc-transport"),
     ]);
-    const iceServers = (healthRef.current?.ice_servers || []).map((server) => ({
+    const iceServers = (voiceConfig.ice_servers || []).map((server) => ({
       urls: server.urls,
       username: server.username || undefined,
       credential: server.credential || undefined,
