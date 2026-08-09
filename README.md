@@ -100,6 +100,13 @@ AGENT_GATEWAY_API_KEY=...
 use the primary selection and its fallback policy. Authentication failures do not trigger fallback;
 only transient API/connection failures and retryable HTTP statuses do.
 
+Ollama is an explicit optional Compose profile and is not started for OpenRouter or another remote
+gateway. For a containerized local Ollama route, start it with:
+
+```sh
+docker compose --profile local-model up -d ollama ollama-init
+```
+
 Ordinary turns default to low reasoning effort. A model-chosen delegation may use medium effort,
 but each specialist has independent request, tool-call, token, wall-time, and one-call-per-role
 budgets. This keeps deep work available without applying its latency and token cost to every prompt.
@@ -154,6 +161,12 @@ To use another environment file:
 ```sh
 VOICE_AI_ENV_FILE=/path/to/environment ./scripts/start.sh
 ```
+
+For a production-like multi-replica deployment, use the fail-closed
+[`compose.production.yaml`](compose.production.yaml) manifest and the deployment runbook in
+[`PRODUCTION_OPERATIONS.md`](docs/PRODUCTION_OPERATIONS.md). It intentionally expects externally
+managed PostgreSQL, model routing, TURN, secrets, and TLS ingress instead of starting development
+dependencies with default credentials.
 
 Open <http://localhost:7860>. A conversation is directly addressable at
 `/conversations/{conversation_id}`; an unauthenticated user returns there after login.

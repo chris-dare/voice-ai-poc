@@ -37,6 +37,7 @@ services:
 
   ollama:
     image: ollama/ollama:0.32.3
+    profiles: ["local-model"]
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 3s
@@ -49,13 +50,16 @@ services:
 
   ollama-init:
     image: ollama/ollama:0.32.3
+    profiles: ["local-model"]
     depends_on:
       ollama:
         condition: service_healthy
     environment:
       OLLAMA_HOST: http://ollama:11434
-    entrypoint: ["ollama"]
-    command: ["pull", "${OLLAMA_MODEL:?OLLAMA_MODEL must be set}"]
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - test -n "$$OLLAMA_MODEL" || { echo "OLLAMA_MODEL must be set" >&2; exit 64; }; exec ollama pull "$$OLLAMA_MODEL"
     restart: "no"
 
   migrate:
@@ -78,8 +82,6 @@ services:
         WHISPER_MODEL: ${WHISPER_MODEL:-base}
     depends_on:
       migrate:
-        condition: service_completed_successfully
-      ollama-init:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql+asyncpg://voice_ai:voice_ai@postgres:5432/voice_ai
@@ -137,8 +139,6 @@ services:
         WHISPER_MODEL: ${WHISPER_MODEL:-base}
     depends_on:
       migrate:
-        condition: service_completed_successfully
-      ollama-init:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql+asyncpg://voice_ai:voice_ai@postgres:5432/voice_ai

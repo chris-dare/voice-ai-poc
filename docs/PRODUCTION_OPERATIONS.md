@@ -34,6 +34,26 @@ database connection limit:
 total potential connections = replicas × (DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW)
 ```
 
+`compose.production.yaml` is the fail-closed application topology for staging or a production-like
+Compose host. It contains no PostgreSQL, Ollama, TURN, ingress, or default credentials: those are
+external managed dependencies. Supply an immutable `VOICE_AI_IMAGE` reference and the required
+variables below, validate the rendered manifest, then run migration before the independently
+scalable services:
+
+```sh
+docker compose -f compose.production.yaml config --quiet
+docker compose -f compose.production.yaml up migrate
+docker compose -f compose.production.yaml up -d --scale agent=2 --scale agent-worker=2 --scale voice-gateway=2
+```
+
+The production manifest exposes container ports only to its Compose network. Attach a trusted TLS
+ingress to the voice gateway; do not publish the private agent port directly. The default local
+Compose graph no longer starts Ollama for gateway-hosted models. Start it explicitly only for a
+local Ollama route with `docker compose --profile local-model up`. Container health checks use
+`/livez`; ingress and rollout readiness checks must use `/readyz`, because a healthy voice replica
+at its session limit deliberately becomes unready for new calls. Container process counts and
+local JSON log growth are bounded by default and remain configurable by the deployment platform.
+
 The voice gateway is stateful for each WebRTC peer connection. Route follow-up ICE requests for a
 `pc_id` to the same gateway replica. `/readyz` returns 503 when that replica reaches its local
 session capacity so the load balancer sends new sessions elsewhere. TURN is mandatory in the
@@ -44,6 +64,7 @@ public profile.
 ```dotenv
 AGENT_DEPLOYMENT_PROFILE=public
 AGENT_RELEASE_VERSION=<immutable-image-tag-or-git-sha>
+VOICE_AI_IMAGE=<immutable-image-reference-preferably-by-digest>
 API_ENABLED=true
 AGENT_EMBEDDED_WORKER=false
 AGENT_SHARED_SECRET=<at-least-32-random-characters>

@@ -9,6 +9,50 @@ permissions:
   contents: read
 
 jobs:
+  deployment-config:
+    name: Deployment configuration
+    runs-on: ubuntu-latest
+    env:
+      VOICE_AI_IMAGE: ghcr.io/example/voice-ai@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      DATABASE_URL: postgresql+asyncpg://voice_ai:test@postgres.example/voice_ai
+      AGENT_MODEL: openrouter:openai/gpt-5.6-luna
+      AGENT_RELEASE_VERSION: test-release
+      AGENT_SHARED_SECRET: test-only-secret-with-at-least-32-characters
+      AUTH0_DOMAIN: test.example.auth0.com
+      AUTH0_AUDIENCE: https://agent-api.test.example
+      AUTH0_SPA_CLIENT_ID: test-spa-client
+      PUBLIC_BASE_URL: https://voice.test.example
+      ICE_SERVERS: '[{"urls":"turns:turn.test.example","username":"test","credential":"test"}]'
+      MAX_CONCURRENT_SESSIONS: "4"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Validate local gateway and optional Ollama graphs
+        run: |
+          docker compose config --format json | python3 scripts/validate_deployment.py remote-local
+          docker compose --profile local-model config --format json | python3 scripts/validate_deployment.py local-model
+
+      - name: Validate fail-closed production graph
+        run: |
+          docker compose -f compose.production.yaml config --format json \
+            | python3 scripts/validate_deployment.py production
+          if env \
+            -u VOICE_AI_IMAGE \
+            -u DATABASE_URL \
+            -u AGENT_MODEL \
+            -u AGENT_RELEASE_VERSION \
+            -u AGENT_SHARED_SECRET \
+            -u AUTH0_DOMAIN \
+            -u AUTH0_AUDIENCE \
+            -u AUTH0_SPA_CLIENT_ID \
+            -u PUBLIC_BASE_URL \
+            -u ICE_SERVERS \
+            -u MAX_CONCURRENT_SESSIONS \
+            docker compose --env-file /dev/null -f compose.production.yaml config --quiet; then
+            echo "The production graph rendered without its required configuration."
+            exit 1
+          fi
+
   lint:
     name: Lint & format
     runs-on: ubuntu-latest

@@ -1,0 +1,146 @@
+name: voice-ai
+
+x-agent-environment: &agent-environment
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be a production PostgreSQL URL}
+  DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+  DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-20}
+  DATABASE_POOL_TIMEOUT_SECONDS: ${DATABASE_POOL_TIMEOUT_SECONDS:-30}
+  AGENT_MODEL: ${AGENT_MODEL:?AGENT_MODEL must be set}
+  AGENT_MODELS: ${AGENT_MODELS:-[]}
+  AGENT_FALLBACK_MODELS: ${AGENT_FALLBACK_MODELS:-[]}
+  AGENT_SUBAGENT_MODEL: ${AGENT_SUBAGENT_MODEL:-}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  AGENT_GATEWAY_BASE_URL: ${AGENT_GATEWAY_BASE_URL:-}
+  AGENT_GATEWAY_API_KEY: ${AGENT_GATEWAY_API_KEY:-}
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+  AGENT_RELEASE_VERSION: ${AGENT_RELEASE_VERSION:?AGENT_RELEASE_VERSION must be immutable}
+  AGENT_DEPLOYMENT_PROFILE: public
+  AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:?AGENT_SHARED_SECRET must be set}
+  AGENT_EMBEDDED_WORKER: "false"
+  API_ENABLED: "true"
+  API_AGENT_ID: ${API_AGENT_ID:-agent_general_assistant}
+  AUTH0_DOMAIN: ${AUTH0_DOMAIN:?AUTH0_DOMAIN must be set}
+  AUTH0_AUDIENCE: ${AUTH0_AUDIENCE:?AUTH0_AUDIENCE must be set}
+  AUTH0_TENANT_CLAIM: ${AUTH0_TENANT_CLAIM:-org_id}
+  API_RATE_LIMIT_RPM: ${API_RATE_LIMIT_RPM:-60}
+  API_EVENT_RETENTION_HOURS: ${API_EVENT_RETENTION_HOURS:-24}
+  API_IDEMPOTENCY_RETENTION_HOURS: ${API_IDEMPOTENCY_RETENTION_HOURS:-24}
+  API_MAX_INPUT_CHARS: ${API_MAX_INPUT_CHARS:-16000}
+  AGENT_WORKER_CONCURRENCY: ${AGENT_WORKER_CONCURRENCY:-4}
+  AGENT_QUEUE_CAPACITY: ${AGENT_QUEUE_CAPACITY:-1000}
+  AGENT_TENANT_ACTIVE_RESPONSE_LIMIT: ${AGENT_TENANT_ACTIVE_RESPONSE_LIMIT:-25}
+  AGENT_MODEL_ROUTE_CONCURRENCY: ${AGENT_MODEL_ROUTE_CONCURRENCY:-8}
+  AGENT_TOOL_ROUTE_CONCURRENCY: ${AGENT_TOOL_ROUTE_CONCURRENCY:-8}
+  AGENT_CAPACITY_WAIT_SECONDS: ${AGENT_CAPACITY_WAIT_SECONDS:-30}
+  AGENT_CAPACITY_LEASE_SECONDS: ${AGENT_CAPACITY_LEASE_SECONDS:-120}
+  AGENT_CAPACITY_HEARTBEAT_SECONDS: ${AGENT_CAPACITY_HEARTBEAT_SECONDS:-15}
+  AGENT_STREAM_BUFFER_CAPACITY: ${AGENT_STREAM_BUFFER_CAPACITY:-128}
+  AGENT_EVENT_BROKER_CAPACITY: ${AGENT_EVENT_BROKER_CAPACITY:-10000}
+  AGENT_MAX_OUTPUT_BYTES: ${AGENT_MAX_OUTPUT_BYTES:-1048576}
+  LOGFIRE_ENABLED: ${LOGFIRE_ENABLED:-true}
+  LOGFIRE_ENVIRONMENT: ${LOGFIRE_ENVIRONMENT:-production}
+  LOGFIRE_CAPTURE_CONTENT: ${LOGFIRE_CAPTURE_CONTENT:-false}
+  LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
+  OTLP_ENDPOINT: ${OTLP_ENDPOINT:-}
+  OTLP_METRICS_ENDPOINT: ${OTLP_METRICS_ENDPOINT:-}
+
+x-runtime: &runtime
+  image: ${VOICE_AI_IMAGE:?VOICE_AI_IMAGE must be an immutable image reference}
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=256m,mode=1777
+    - /home/voice-ai/.cache:size=256m,uid=10001,gid=10001,mode=0700
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: ${CONTAINER_PIDS_LIMIT:-512}
+  logging:
+    driver: json-file
+    options:
+      max-size: ${CONTAINER_LOG_MAX_SIZE:-20m}
+      max-file: ${CONTAINER_LOG_MAX_FILES:-5}
+  restart: unless-stopped
+  stop_grace_period: 45s
+
+services:
+  migrate:
+    <<: *runtime
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be a production PostgreSQL URL}
+    command: ["migrate"]
+    restart: "no"
+
+  agent:
+    <<: *runtime
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *agent-environment
+      AGENT_HOST: 0.0.0.0
+      AGENT_PORT: 8100
+    command: ["agent"]
+    expose: ["8100"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/livez')",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+  agent-worker:
+    <<: *runtime
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *agent-environment
+    command: ["worker"]
+
+  voice-gateway:
+    <<: *runtime
+    depends_on:
+      agent:
+        condition: service_healthy
+    environment:
+      AGENT_BASE_URL: http://agent:8100
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      KOKORO_VOICE: ${KOKORO_VOICE:-af_heart}
+      MODEL_CACHE_DIR: /app/models
+      FRONTEND_DIST: /app/frontend/dist
+      DEPLOYMENT_PROFILE: public
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL must be an HTTPS URL}
+      ICE_SERVERS: ${ICE_SERVERS:?ICE_SERVERS must include a TURN server}
+      MAX_CONCURRENT_SESSIONS: ${MAX_CONCURRENT_SESSIONS:?MAX_CONCURRENT_SESSIONS must be set}
+      API_ENABLED: "true"
+      API_AGENT_ID: ${API_AGENT_ID:-agent_general_assistant}
+      AUTH0_DOMAIN: ${AUTH0_DOMAIN:?AUTH0_DOMAIN must be set}
+      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE:?AUTH0_AUDIENCE must be set}
+      AUTH0_SPA_CLIENT_ID: ${AUTH0_SPA_CLIENT_ID:?AUTH0_SPA_CLIENT_ID must be set}
+      AUTH0_TENANT_CLAIM: ${AUTH0_TENANT_CLAIM:-org_id}
+      LOGFIRE_ENABLED: ${LOGFIRE_ENABLED:-true}
+      LOGFIRE_ENVIRONMENT: ${LOGFIRE_ENVIRONMENT:-production}
+      LOGFIRE_CAPTURE_CONTENT: ${LOGFIRE_CAPTURE_CONTENT:-false}
+      LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
+      OTLP_ENDPOINT: ${OTLP_ENDPOINT:-}
+      OTLP_METRICS_ENDPOINT: ${OTLP_METRICS_ENDPOINT:-}
+    command: ["voice"]
+    expose: ["7860"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/livez')",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
