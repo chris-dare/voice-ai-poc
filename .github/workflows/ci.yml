@@ -24,6 +24,7 @@ jobs:
       PUBLIC_BASE_URL: https://voice.test.example
       ICE_SERVERS: '[{"urls":"turns:turn.test.example","username":"test","credential":"test"}]'
       MAX_CONCURRENT_SESSIONS: "4"
+      WHISPER_REVISION: ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -48,6 +49,7 @@ jobs:
             -u PUBLIC_BASE_URL \
             -u ICE_SERVERS \
             -u MAX_CONCURRENT_SESSIONS \
+            -u WHISPER_REVISION \
             docker compose --env-file /dev/null -f compose.production.yaml config --quiet; then
             echo "The production graph rendered without its required configuration."
             exit 1
@@ -192,12 +194,13 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
 
   supply-chain:
-    name: SBOM & vulnerability report
+    name: Source & image supply chain
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Generate SPDX SBOM
+      - name: Generate source SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: .
@@ -207,12 +210,61 @@ jobs:
           upload-artifact-retention: 30
           upload-release-assets: false
 
-      - name: Scan SBOM for critical vulnerabilities
+      - name: Scan source SBOM for critical vulnerabilities
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: voice-ai.spdx.json
           fail-build: true
           severity-cutoff: critical
+          output-format: table
+
+      - name: Build the production image
+        env:
+          IMAGE: voice-ai-ci:${{ github.sha }}
+        run: |
+          docker buildx create --name voice-ai-ci --driver docker-container --use
+          docker buildx build \
+            --load \
+            --provenance=false \
+            --cache-from type=gha,scope=voice-ai-production \
+            --cache-to type=gha,mode=max,scope=voice-ai-production \
+            --build-arg WHISPER_MODEL=base \
+            --build-arg WHISPER_REVISION=ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66 \
+            --tag "$IMAGE" \
+            .
+
+      - name: Verify unprivileged image assets
+        env:
+          IMAGE: voice-ai-ci:${{ github.sha }}
+        run: |
+          docker run --rm --entrypoint python "$IMAGE" -c \
+            "import os; from faster_whisper.utils import download_model; from pathlib import Path; from voice_ai.voice.speech.assets import kokoro_assets_valid; p=download_model('base', cache_dir='/app/models/whisper', revision='ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66', local_files_only=True); assert Path(p).is_dir(); assert kokoro_assets_valid(Path('/app/models/kokoro')); assert Path('/app/frontend/dist/index.html').is_file(); assert os.getuid() == 10001; assert not os.access('/app', os.W_OK)"
+
+      - name: Generate production image SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: voice-ai-ci:${{ github.sha }}
+          format: spdx-json
+          output-file: voice-ai-image.spdx.json
+          artifact-name: voice-ai-image-sbom.spdx.json
+          upload-artifact-retention: 30
+          upload-release-assets: false
+
+      - name: Scan production image for critical vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: voice-ai-image.spdx.json
+          fail-build: true
+          severity-cutoff: critical
+          output-format: table
+
+      - name: Scan production image for fixable high vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: voice-ai-image.spdx.json
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
           output-format: table
 
   semgrep:
