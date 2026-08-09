@@ -112,7 +112,7 @@ jobs:
       # CVE-2025-71176 is pytest's tmpdir handling — a dev-only dependency that
       # never runs in the shipped image. Drop the ignore once pytest 9 lands here.
       - name: Audit dependencies for vulnerabilities
-        run: uv audit --preview --ignore GHSA-6w46-j5rx-g56g --ignore PYSEC-2026-1845
+        run: uv audit --preview --ignore GHSA-6w46-j5rx-g56g
 
   semgrep:
     name: SAST (Semgrep)
