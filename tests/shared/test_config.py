@@ -14,6 +14,7 @@ def test_deployed_services_only_load_their_owned_configuration() -> None:
 
     assert "whisper_model" in VoiceSettings.model_fields
     assert "kokoro_voice" in VoiceSettings.model_fields
+    assert "voice_max_request_body_bytes" in VoiceSettings.model_fields
     assert "agent_model" not in VoiceSettings.model_fields
     assert "database_url" not in VoiceSettings.model_fields
     assert "api_max_request_body_bytes" not in VoiceSettings.model_fields

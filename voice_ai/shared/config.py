@@ -244,6 +244,7 @@ class VoiceSettings(AuthSettings):
     public_base_url: str | None = None
     ice_servers: list[IceServer] = Field(default_factory=list)
     max_concurrent_sessions: int = Field(default=1, ge=1, le=10_000)
+    voice_max_request_body_bytes: int = Field(default=1_048_576, ge=1_024, le=100_000_000)
     frontend_dist: Path = Path("frontend/dist")
 
     @field_validator("ice_servers", mode="before")

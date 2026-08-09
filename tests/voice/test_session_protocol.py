@@ -127,6 +127,34 @@ async def test_browser_config_exposes_only_public_auth_values(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_gateway_rejects_chunked_body_over_its_raw_request_limit(tmp_path) -> None:
+    app = create_app(
+        Settings(
+            frontend_dist=tmp_path,
+            voice_max_request_body_bytes=1_024,
+        )
+    )
+
+    async def oversized_body():
+        yield b"{" + (b'"padding":"' + (b"x" * 1_024))
+        yield b'"}'
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/telemetry",
+            headers={"Content-Type": "application/json"},
+            content=oversized_body(),
+        )
+
+    assert response.status_code == 413
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert response.json()["code"] == "request_body_too_large"
+
+
+@pytest.mark.asyncio
 async def test_health_does_not_expose_turn_credentials(tmp_path) -> None:
     settings = Settings(
         frontend_dist=tmp_path,

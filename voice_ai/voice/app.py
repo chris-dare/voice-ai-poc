@@ -18,6 +18,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from voice_ai.shared.config import VoiceSettings, get_voice_settings
+from voice_ai.shared.http import request_body_limit
 from voice_ai.shared.observability import (
     configure_observability,
     instrument_fastapi,
@@ -185,6 +186,7 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
             )
 
     app = FastAPI(title=configured.app_name, lifespan=lifespan)
+    request_body_limit(app, max_bytes=configured.voice_max_request_body_bytes)
 
     @app.get("/livez", include_in_schema=False)
     async def livez() -> dict[str, str]:
