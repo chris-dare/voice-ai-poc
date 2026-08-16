@@ -34,6 +34,14 @@ database connection limit:
 total potential connections = replicas × (DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW)
 ```
 
+The `20260816_0001_core_baseline` migration is the first-deployment schema snapshot. It assumes
+the target cloud database is empty; it does not upgrade databases stamped with the removed
+development migration chain. Before using this revision on an old local checkout, remove the
+local PostgreSQL volume (`docker compose down -v`) and start it again. For a database that must be
+preserved, take a backup, manually remove the retired domain tables/columns, and stamp the new
+baseline only after verifying the resulting schema. Future model changes must use new explicit
+Alembic revisions; do not add model imports or `metadata.create_all()` to the baseline.
+
 `compose.production.yaml` is the fail-closed application topology for staging or a production-like
 Compose host. It contains no PostgreSQL, Ollama, TURN, ingress, or default credentials: those are
 external managed dependencies. Supply an immutable `VOICE_AI_IMAGE` reference and the required
@@ -50,12 +58,12 @@ The production manifest exposes container ports only to its Compose network. Att
 ingress to the voice gateway; do not publish the private agent port directly. The default local
 Compose graph no longer starts Ollama for gateway-hosted models. Start it explicitly only for a
 local Ollama route with `docker compose --profile local-model up`. Container health checks use
-`/livez`; ingress and rollout readiness checks must use `/readyz`, because a healthy voice replica
+`/live`; ingress and rollout readiness checks must use `/ready`, because a healthy voice replica
 at its session limit deliberately becomes unready for new calls. Container process counts and
 local JSON log growth are bounded by default and remain configurable by the deployment platform.
 
 The voice gateway is stateful for each WebRTC peer connection. Route follow-up ICE requests for a
-`pc_id` to the same gateway replica. `/readyz` returns 503 when that replica reaches its local
+`pc_id` to the same gateway replica. `/ready` returns 503 when that replica reaches its local
 session capacity so the load balancer sends new sessions elsewhere. TURN is mandatory in the
 public profile.
 
@@ -116,7 +124,7 @@ Changing a voice model or base image therefore requires an explicit reviewed pin
 application and model files remain root-owned and read-only to the unprivileged service account;
 only the explicitly configured tmpfs paths are writable.
 
-The API `/readyz` endpoint requires at least one recently heartbeating response worker whenever the
+The API `/ready` endpoint requires at least one recently heartbeating response worker whenever the
 public API is enabled. Start workers independently from API readiness (both may depend on the
 completed migration job); otherwise a worker that waits for API readiness creates a startup cycle.
 `/capabilities` is protected by the internal service credential and publishes the effective Core

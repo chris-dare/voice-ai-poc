@@ -234,8 +234,8 @@ def create_agent_app(
         ):
             raise HTTPException(401, "Invalid agent service credential")
 
-    @app.get("/livez", include_in_schema=False)
-    async def livez() -> dict[str, str]:
+    @app.get("/live", include_in_schema=False)
+    async def live() -> dict[str, str]:
         return {"status": "alive"}
 
     @app.get(
@@ -246,8 +246,8 @@ def create_agent_app(
     async def capabilities() -> dict[str, Any]:
         return capability_manifest(configured)
 
-    @app.get("/readyz", include_in_schema=False)
-    async def readyz() -> JSONResponse:
+    @app.get("/ready", include_in_schema=False)
+    async def ready() -> JSONResponse:
         model_status = await runtime.model_readiness()
         database_ready = False
         worker_status = {

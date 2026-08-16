@@ -47,18 +47,18 @@ class FakeRuntime:
         yield ResponseStarted(turn_id=request.turn_id)
         if request.text == "yes please":
             self.pending.discard(request.session_id)
-            text = "The plan change was submitted."
+            text = "The approved action was submitted."
         elif request.text == "no":
             self.pending.discard(request.session_id)
-            text = "No plan change was made."
-        elif "switch" in request.text.lower():
+            text = "No action was taken."
+        elif "approve" in request.text.lower():
             self.pending.add(request.session_id)
-            text = "Flex 20 costs GHS 20.00 per month."
+            text = "This action is ready for approval."
         else:
             text = f"Answer: {request.text}"
         if "balance" in request.text.lower():
-            yield ToolStarted(tool="get_account_balance", label="Checking balance")
-            yield ToolCompleted(tool="get_account_balance", label="Checking balance")
+            yield ToolStarted(tool="lookup_context", label="Checking context")
+            yield ToolCompleted(tool="lookup_context", label="Checking context")
         state = self.states.setdefault(request.session_id, {"turns": []})
         state["turns"].append(request.text)
         state["pending"] = request.session_id in self.pending
@@ -96,10 +96,9 @@ class FakeRuntime:
         if session_id not in self.pending:
             return None
         return {
-            "plan_code": "FLEX_20",
-            "plan_name": "Flex 20",
-            "quoted_price": "20.00",
-            "currency": "GHS",
+            "type": "confirmation",
+            "title": "Confirm external action",
+            "description": "The assistant is ready to perform the requested external action.",
             "created_at": datetime.now(UTC),
         }
 
@@ -256,8 +255,8 @@ async def test_durable_conversation_response_and_replay(public_service, auth) ->
     assert completed["output"][1] == {
         "id": completed["output"][1]["id"],
         "type": "tool_activity",
-        "name": "get_account_balance",
-        "label": "Checking balance",
+        "name": "lookup_context",
+        "label": "Checking context",
         "status": "succeeded",
     }
     assert completed["usage"]["input_tokens"] == 12
@@ -553,7 +552,7 @@ async def test_required_action_approves_and_resumes_same_response(public_service
         ResponseCreateRequest(
             conversation_id=conversation["id"],
             model="test:assistant",
-            input="Switch me to Flex 20",
+            input="Approve this external action",
             background=True,
         ),
         None,
@@ -576,7 +575,7 @@ async def test_required_action_approves_and_resumes_same_response(public_service
     completed = await public_service.wait_for_terminal(response["id"])
     assert completed["status"] == "completed"
     assert completed["required_action"] is None
-    assert completed["output"][0]["content"][0]["text"] == ("The plan change was submitted.")
+    assert completed["output"][0]["content"][0]["text"] == ("The approved action was submitted.")
 
 
 @pytest.mark.asyncio
@@ -586,7 +585,7 @@ async def test_required_action_survives_service_restart(public_service, auth) ->
         ResponseCreateRequest(
             agent_id="agent_general_assistant",
             model="test:assistant",
-            input="Switch me to Flex 20",
+            input="Approve this external action",
             background=True,
         ),
         None,
@@ -612,7 +611,9 @@ async def test_required_action_survives_service_restart(public_service, auth) ->
         )
         completed = await restarted.wait_for_terminal(response["id"])
         assert completed["status"] == "completed"
-        assert completed["output"][0]["content"][0]["text"] == ("The plan change was submitted.")
+        assert completed["output"][0]["content"][0]["text"] == (
+            "The approved action was submitted."
+        )
     finally:
         await restarted.shutdown()
 
@@ -887,7 +888,7 @@ async def test_tool_and_recovery_metrics_are_emitted_without_tenant_identifiers(
         assert recovery_metric.call_args.kwargs["delay_ms"] >= 0
         assert tool_metric.call_args.kwargs == {
             "duration_ms": tool_metric.call_args.kwargs["duration_ms"],
-            "tool": "get_account_balance",
+            "tool": "lookup_context",
             "source": "root",
             "status": "succeeded",
         }
@@ -1159,7 +1160,7 @@ async def test_public_api_readiness_requires_a_live_response_worker(
     )
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get("/readyz")
+            response = await client.get("/ready")
 
     assert response.status_code == 503
     assert response.json()["response_workers"]["ready"] is False

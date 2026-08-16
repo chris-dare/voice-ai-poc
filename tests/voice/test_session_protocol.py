@@ -10,12 +10,32 @@ from httpx import ASGITransport, AsyncClient
 from voice_ai.shared.config import Settings
 from voice_ai.voice.app import (
     SessionCapacity,
-    _require_audio_only_offer,
     _run_session_lazy,
+    _validate_voice_offer,
     create_app,
 )
 from voice_ai.voice.health import CheckResult
 from voice_ai.voice.runtime import run_session
+
+
+def test_voice_offer_validation_allows_pipecat_video_transceivers() -> None:
+    _validate_voice_offer(
+        {
+            "type": "offer",
+            "sdp": (
+                "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+                "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendrecv\r\n"
+                "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly"
+            ),
+        }
+    )
+
+
+def test_voice_offer_validation_rejects_malformed_signaling_input() -> None:
+    with pytest.raises(HTTPException, match="non-empty SDP"):
+        _validate_voice_offer({"type": "offer", "sdp": ""})
+    with pytest.raises(HTTPException, match="must contain an offer"):
+        _validate_voice_offer({"type": "answer", "sdp": "v=0"})
 
 
 @pytest.mark.asyncio
@@ -33,22 +53,6 @@ async def test_voice_session_capacity_emits_admission_and_saturation_metrics(mon
         {"event": "rejected", "active": 1},
         {"event": "released", "active": 0},
     ]
-
-
-def test_voice_offer_accepts_audio_only_sdp() -> None:
-    _require_audio_only_offer(
-        {"sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP"}
-    )
-
-
-def test_voice_offer_rejects_video_before_webrtc_processing() -> None:
-    with pytest.raises(HTTPException) as error:
-        _require_audio_only_offer(
-            {"sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 96"}
-        )
-
-    assert getattr(error.value, "status_code", None) == 422
-    assert getattr(error.value, "detail", None) == "Voice sessions accept audio media only"
 
 
 @pytest.mark.asyncio
@@ -193,7 +197,7 @@ async def test_health_does_not_expose_turn_credentials(tmp_path) -> None:
         transport=ASGITransport(app=app),
         base_url="http://test",
     ) as client:
-        response = await client.get("/healthz")
+        response = await client.get("/health")
 
     assert response.status_code == 503
     assert response.json()["ice_server_count"] == 1
@@ -312,7 +316,7 @@ async def test_voice_initialization_retries_transient_dependency_failure(
             transport=ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/readyz")
+            response = await client.get("/ready")
 
     assert checks.await_count == 2
     assert response.status_code == 200
@@ -519,12 +523,12 @@ async def test_authenticated_voice_signaling_is_bound_to_the_creating_token(
                 headers={"Authorization": "Bearer another-token"},
                 json={"pc_id": "pc_owned", "candidates": []},
             )
-            active_health = await client.get("/healthz")
+            active_health = await client.get("/health")
 
             stop_session.set()
             await asyncio.wait_for(session_finished.wait(), timeout=1)
             for _ in range(10):
-                finished_health = await client.get("/healthz")
+                finished_health = await client.get("/health")
                 if finished_health.json()["authenticated_sessions"] == 0:
                     break
                 await asyncio.sleep(0)

@@ -130,18 +130,12 @@ async def _run_until_termination(worker: Awaitable[None]) -> None:
 
 
 @app.command()
-def seed(
-    reset_demo: bool = typer.Option(
-        False,
-        "--reset-demo",
-        hidden=True,
-    ),
-) -> None:
-    """Apply database migrations (the legacy option is accepted but ignored)."""
-    asyncio.run(_seed(reset_demo))
+def seed() -> None:
+    """Apply database migrations."""
+    asyncio.run(_seed())
 
 
-async def _seed(reset_demo: bool) -> None:
+async def _seed() -> None:
     from voice_ai.agent.persistence.database import Database
     from voice_ai.migrations import upgrade_database
 
@@ -246,21 +240,27 @@ def evals_command(
 
 @app.command()
 def doctor(
-    fix: bool = typer.Option(False, help="Provision missing local dependencies and demo data."),
+    fix: bool = typer.Option(
+        False, help="Provision missing local dependencies and database schema."
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask before applying fixes."),
     offline: bool = typer.Option(
         False,
-        help="Perform a demo-day check without downloading or repairing anything.",
+        help="Check readiness without downloading or repairing anything.",
     ),
     smoke: bool = typer.Option(
         False,
         help="After checks pass, run STT, tool-selection, and TTS inference.",
     ),
 ) -> None:
-    """Check whether this checkout can survive a live demonstration."""
+    """Check whether this checkout is ready to run locally."""
     if fix and offline:
         raise typer.BadParameter("--fix and --offline cannot be used together")
-    if fix and not yes and not typer.confirm("Provision models, database data and browser assets?"):
+    if (
+        fix
+        and not yes
+        and not typer.confirm("Provision models, database schema and browser assets?")
+    ):
         raise typer.Abort()
     code = asyncio.run(_doctor(fix=fix, offline=offline, smoke=smoke))
     if code:
@@ -299,7 +299,7 @@ async def _apply_fixes(settings: Any, database: Any) -> None:
         ("Downloading the sentence tokenizer", lambda: _download_nltk(settings)),
         ("Downloading the Kokoro voice model", lambda: _download_kokoro(settings)),
         (
-            "Applying database migrations and restoring demo data",
+            "Applying database migrations",
             lambda: _repair_database(database),
         ),
     ]
@@ -484,8 +484,8 @@ def _render_checks(checks: list[Any], *, offline: bool) -> None:
     status = overall_status(checks)
     title = "OFFLINE PREFLIGHT" if offline else "VOICE AI DOCTOR"
     message = {
-        "ready": "[bold green]READY[/bold green] — the demo prerequisites are present.",
-        "degraded": "[bold yellow]DEGRADED[/bold yellow] — usable, but review warnings before the demo.",
+        "ready": "[bold green]READY[/bold green] — the local prerequisites are present.",
+        "degraded": "[bold yellow]DEGRADED[/bold yellow] — usable, but review the warnings.",
         "not_ready": "[bold red]NOT READY[/bold red] — run the exact fixes above.",
     }[status]
     console.print(Panel(message, title=title))

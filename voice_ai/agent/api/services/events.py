@@ -5,7 +5,7 @@ from collections import OrderedDict
 
 
 class EventBroker:
-    """Coordinates in-process subscribers waiting for durable response events."""
+    """Coordinates in-process listeners waiting for durable response events."""
 
     def __init__(self, maximum_entries: int = 10_000) -> None:
         if maximum_entries < 1:

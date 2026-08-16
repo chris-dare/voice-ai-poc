@@ -72,7 +72,7 @@ async def test_auth0_verifier_checks_claims_and_combines_permissions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auth0_verifier_accepts_user_without_domain_identity_binding() -> None:
+async def test_auth0_verifier_accepts_user_without_external_domain_binding() -> None:
     settings, verifier, private_key = _verifier_and_key()
 
     context = await verifier.verify(_token(settings, private_key, org_id="org_1"))

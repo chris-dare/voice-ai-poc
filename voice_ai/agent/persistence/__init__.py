@@ -1,1 +1,1 @@
-"""Agent-owned persistence and demo data."""
+"""Agent-owned persistence."""

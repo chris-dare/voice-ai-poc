@@ -27,7 +27,6 @@ class Conversation(TableModel, table=True):
     runtime_session_id: UUID = Field(unique=True, nullable=False)
     tenant_id: str = Field(sa_type=String(255), nullable=False)
     subject_id: str = Field(sa_type=String(255), nullable=False)
-    subscriber_id: UUID | None = Field(default=None, nullable=True)
     agent_id: str = Field(sa_type=String(120), nullable=False)
     model_id: str = Field(sa_type=String(255), nullable=False)
     status: str = Field(sa_type=String(24), nullable=False)
@@ -53,7 +52,6 @@ class ResponseRecord(TableModel, table=True):
     runtime_session_id: UUID = Field(nullable=False)
     tenant_id: str = Field(sa_type=String(255), nullable=False)
     subject_id: str = Field(sa_type=String(255), nullable=False)
-    subscriber_id: UUID | None = Field(default=None, nullable=True)
     agent_id: str = Field(sa_type=String(120), nullable=False)
     model_id: str = Field(sa_type=String(255), nullable=False)
     status: str = Field(sa_type=String(24), nullable=False)
@@ -271,21 +269,3 @@ class IdempotencyRecord(TableModel, table=True):
         ),
         Index("ix_api_idempotency_expiry", "expires_at"),
     )
-
-
-class IdentityBinding(TableModel, table=True):
-    """Tenant-scoped association between an authenticated subject and a subscriber."""
-
-    __tablename__ = "api_identity_bindings"
-
-    tenant_id: str = Field(sa_type=String(255), primary_key=True)
-    subject_id: str = Field(sa_type=String(255), primary_key=True)
-    subscriber_id: UUID = Field(
-        foreign_key="subscribers.id",
-        ondelete="RESTRICT",
-        nullable=False,
-    )
-    active: bool = Field(default=True, sa_type=Boolean, nullable=False)
-    created_at: datetime = Field(sa_type=DateTime(timezone=True), nullable=False)
-
-    __table_args__ = (Index("ix_api_identity_bindings_subscriber", "subscriber_id"),)

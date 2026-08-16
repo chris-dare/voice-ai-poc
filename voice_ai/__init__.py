@@ -1,4 +1,4 @@
-"""Local telco voice assistant."""
+"""Local general-purpose voice assistant."""
 
 import os
 from pathlib import Path

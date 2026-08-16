@@ -90,8 +90,8 @@ def _validate_production(services: dict[str, Any]) -> list[str]:
     for name in ("agent", "voice-gateway"):
         test = services.get(name, {}).get("healthcheck", {}).get("test", [])
         rendered = " ".join(str(item) for item in test)
-        if "/livez" not in rendered or "/readyz" in rendered:
-            errors.append(f"{name} container healthcheck must use /livez")
+        if "/live" not in rendered or "/ready" in rendered:
+            errors.append(f"{name} container healthcheck must use /live")
 
     agent_env = services.get("agent", {}).get("environment", {})
     if agent_env.get("AGENT_DEPLOYMENT_PROFILE") != "public":

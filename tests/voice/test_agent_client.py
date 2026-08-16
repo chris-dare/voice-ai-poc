@@ -33,7 +33,7 @@ async def test_public_voice_turn_uses_durable_response_stream() -> None:
             content=_sse(
                 {
                     "type": "response.tool.started",
-                    "name": "get_account_balance",
+                    "name": "lookup_context",
                     "label": "Checking account balance",
                 },
                 {"type": "response.output_text.delta", "delta": "GHS 42.50"},
@@ -75,7 +75,7 @@ async def test_public_voice_turn_uses_durable_response_stream() -> None:
         "metadata": {"channel": "voice"},
     }
     service._push_llm_text.assert_awaited_once_with("GHS 42.50")
-    assert on_event.await_args.args[0]["data"]["tool"] == "get_account_balance"
+    assert on_event.await_args.args[0]["data"]["tool"] == "lookup_context"
     assert service._active_response_id is None
 
 

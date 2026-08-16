@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from voice_ai.agent import eval_models as _eval_models  # noqa: F401
 from voice_ai.agent.api import models as _api_models  # noqa: F401
 from voice_ai.agent.persistence.model import TableModel
-from voice_ai.agent.telco import models as _telco_models  # noqa: F401
 from voice_ai.shared.config import get_agent_settings
 
 config = context.config

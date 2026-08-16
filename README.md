@@ -113,7 +113,7 @@ budgets. This keeps deep work available without applying its latency and token c
 Structured plan tracking is separately opt-in because it adds tool turns and is unnecessary for
 most interactive requests.
 
-`voice-ai seed` now applies migrations; it does not create a default subscriber or domain account.
+`voice-ai seed` applies migrations only. Domain data is never seeded into the core service.
 
 Configure Auth0 in `.env`:
 
@@ -199,7 +199,7 @@ Browser calls go through the gateway’s same-origin `/agent-api` proxy. The bro
 model-provider/gateway credentials or connects directly to the model host or PostgreSQL.
 
 The private voice seam is `POST /v1/turns/stream` with NDJSON events. It accepts `session_id`,
-optional `turn_id`, and `text`; it does not accept a subscriber ID.
+optional `turn_id`, and `text`; domain context belongs behind configured MCP servers.
 
 ## Quality checks
 
@@ -230,9 +230,8 @@ do not depend on one observability vendor. The durable run stores the dataset di
 model/configuration, complete report, per-case outputs and scores, timings, and Logfire trace
 identifiers. Search Logfire by the `eval_run_id` printed by the CLI to correlate both views.
 
-The frontend and API use `/livez` for liveness and `/readyz` for dependency readiness. The `z`
-suffix is a common convention that reduces collision with business routes; it has no special HTTP
-semantics.
+The frontend and API use `/live` for liveness and `/ready` for dependency readiness. The voice
+gateway exposes `/health` for detailed dependency and session status.
 
 ## Dependency notes
 
