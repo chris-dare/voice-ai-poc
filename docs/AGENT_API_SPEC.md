@@ -896,7 +896,7 @@ what the agent did without replaying every text-delta event:
 {
   "id": "toolrun_01J...",
   "type": "tool_activity",
-  "name": "explain_latest_bill",
+  "name": "lookup_context",
   "label": "Analysing your latest bill",
   "status": "succeeded"
 }

@@ -188,12 +188,12 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
     app = FastAPI(title=configured.app_name, lifespan=lifespan)
     request_body_limit(app, max_bytes=configured.voice_max_request_body_bytes)
 
-    @app.get("/livez", include_in_schema=False)
-    async def livez() -> dict[str, str]:
+    @app.get("/live", include_in_schema=False)
+    async def live() -> dict[str, str]:
         return {"status": "alive"}
 
-    @app.get("/healthz", include_in_schema=False)
-    async def healthz() -> JSONResponse:
+    @app.get("/health", include_in_schema=False)
+    async def health() -> JSONResponse:
         return JSONResponse(
             {
                 "status": voice_status,
@@ -206,8 +206,8 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
             status_code=503 if voice_status in {"warming", "not_ready"} else 200,
         )
 
-    @app.get("/readyz", include_in_schema=False)
-    async def readyz() -> JSONResponse:
+    @app.get("/ready", include_in_schema=False)
+    async def ready() -> JSONResponse:
         ready = voice_status not in {"warming", "not_ready"} and capacity.active < capacity.maximum
         return JSONResponse(
             {"status": "ready" if ready else "not_ready"},
@@ -359,8 +359,8 @@ def create_app(settings: VoiceSettings | None = None) -> FastAPI:
         x_model_id: Annotated[str | None, Header()] = None,
     ) -> dict[str, str] | None:
         if voice_runtime is None or voice_status in {"warming", "not_ready"}:
-            raise HTTPException(503, "Voice services are still warming up; inspect /healthz")
-        _require_audio_only_offer(request)
+            raise HTTPException(503, "Voice services are still warming up; inspect /health")
+        _validate_voice_offer(request)
         voice_request = voice_runtime.parse_offer(request)
         public_access_token: str | None = None
         conversation_id: str | None = None
@@ -505,13 +505,18 @@ def _bearer_token(authorization: str | None) -> str:
     return token
 
 
-def _require_audio_only_offer(payload: dict[str, Any]) -> None:
-    """Reject video media before untrusted SDP reaches the WebRTC decoder stack."""
+def _validate_voice_offer(payload: dict[str, Any]) -> None:
+    """Validate signaling input without treating negotiated media as active tracks."""
     sdp = payload.get("sdp")
-    if not isinstance(sdp, str):
-        return
-    if any(line.strip().lower().startswith("m=video") for line in sdp.splitlines()):
-        raise HTTPException(422, "Voice sessions accept audio media only")
+    if not isinstance(sdp, str) or not sdp.strip():
+        raise HTTPException(422, "A non-empty SDP offer is required")
+    if len(sdp) > 1_000_000:
+        raise HTTPException(422, "The SDP offer is too large")
+    if payload.get("type") != "offer":
+        raise HTTPException(422, "The WebRTC request must contain an offer")
+    pc_id = payload.get("pc_id")
+    if pc_id is not None and (not isinstance(pc_id, str) or len(pc_id) > 255):
+        raise HTTPException(422, "The peer connection id is invalid")
 
 
 async def _validate_voice_conversation(

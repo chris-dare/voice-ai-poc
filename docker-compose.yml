@@ -129,7 +129,7 @@ services:
     ports:
       - "127.0.0.1:8100:8100"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/readyz')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/ready')"]
       interval: 3s
       timeout: 5s
       retries: 30

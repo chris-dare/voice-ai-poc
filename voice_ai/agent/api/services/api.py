@@ -293,7 +293,6 @@ class AgentApiService:
                 runtime_session_id=uuid4(),
                 tenant_id=auth.tenant_id,
                 subject_id=auth.subject_id,
-                subscriber_id=None,
                 agent_id=request.agent_id,
                 model_id=model_id,
                 status="active",
@@ -552,7 +551,6 @@ class AgentApiService:
                 runtime_session_id=runtime_session_id,
                 tenant_id=auth.tenant_id,
                 subject_id=auth.subject_id,
-                subscriber_id=None,
                 agent_id=agent_id,
                 model_id=model_id,
                 status="queued",
@@ -1762,10 +1760,11 @@ class AgentApiService:
             response_id=response_id,
             tenant_id=response_snapshot.tenant_id,
             subject_id=response_snapshot.subject_id,
-            type="confirmation",
-            title=f"Change plan to {pending['plan_name']}",
-            description=(
-                f"The monthly charge will be {pending['currency']} {pending['quoted_price']}."
+            type=str(pending.get("type") or "confirmation"),
+            title=str(pending.get("title") or "Approval required"),
+            description=str(
+                pending.get("description")
+                or "The assistant is waiting for your approval to continue."
             ),
             expires_at=expires_at,
             decision=None,

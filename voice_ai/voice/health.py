@@ -83,7 +83,7 @@ def overall_status(checks: list[CheckResult]) -> str:
 async def _agent_service_check(settings: VoiceSettings) -> CheckResult:
     try:
         async with httpx.AsyncClient(timeout=3) as client:
-            response = await client.get(f"{settings.agent_base_url.rstrip('/')}/readyz")
+            response = await client.get(f"{settings.agent_base_url.rstrip('/')}/ready")
         payload = response.json()
         if response.status_code != 200:
             return CheckResult(

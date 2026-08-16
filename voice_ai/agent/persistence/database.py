@@ -78,7 +78,6 @@ class Database:
         # Import model modules before create_all so every table is registered.
         from voice_ai.agent import eval_models as _eval_models  # noqa: F401
         from voice_ai.agent.api import models as _api_models  # noqa: F401
-        from voice_ai.agent.telco import models as _telco_models  # noqa: F401
 
         async with self.engine.begin() as connection:
             await connection.run_sync(TableModel.metadata.create_all)

@@ -170,7 +170,7 @@ export function useVoiceAI() {
 
   const checkHealth = useCallback(async () => {
     try {
-      const response = await fetch("/healthz", { cache: "no-store" });
+      const response = await fetch("/health", { cache: "no-store" });
       const nextHealth = await response.json() as HealthState;
       setHealth(nextHealth);
       healthRef.current = nextHealth;

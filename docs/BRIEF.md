@@ -1,9 +1,8 @@
 # Voice AI POC — implementation brief
 
 Build a browser-based, authenticated AI assistant with durable text conversations and
-interruptible real-time voice. The assistant is general purpose first. Domain integrations,
-including a future telco demo, connect later through MCP instead of being hard-coded into the
-core runtime.
+interruptible real-time voice. The assistant is general purpose first. Domain integrations
+connect later through optional MCP servers instead of being hard-coded into the core runtime.
 
 ## Product outcome
 
@@ -120,8 +119,8 @@ guidance stays synchronized with dependency upgrades.
 - persisted model message history and tool activity;
 - cancellation and replay using `Last-Event-ID`.
 
-Authentication establishes application identity; it does not require a telco subscriber mapping.
-A future domain capability must resolve its own authorized customer/account context. Conversation
+Authentication establishes application identity; it does not require a domain-account mapping.
+An external domain capability must resolve its own authorized customer/account context. Conversation
 URLs are `/conversations/{conversation_id}`. An unauthenticated visitor signs in and returns to the
 same URL; ownership is enforced by the agent API.
 
@@ -173,14 +172,14 @@ control during generation.
 - Auth0 is mandatory when the public API/UI is enabled.
 - Logfire instrumentation covers FastAPI, Pydantic AI, HTTPX, SQLAlchemy/asyncpg, system metrics,
   application logs, and custom latency/auth signals.
-- `/livez` answers process liveness. `/readyz` validates model configuration, locally probes Ollama
+- `/live` answers process liveness. `/ready` validates model configuration, locally probes Ollama
   when selected, checks PostgreSQL/auth, and avoids a billable remote model call.
 - Public microphone use requires HTTPS and TURN outside localhost/LAN-safe environments.
 - Kokoro is the only supported TTS backend. A session never changes voices automatically.
 
 ## Acceptance criteria
 
-- A new authenticated user can create and resume conversations without a subscriber record.
+- A new authenticated user can create and resume conversations without an external domain record.
 - Text and voice turns call the real model and persist their final output.
 - A calculation causes a visible `run_code` lifecycle and runs inside Monty.
 - A current-information question can cause a visible web-search lifecycle.
